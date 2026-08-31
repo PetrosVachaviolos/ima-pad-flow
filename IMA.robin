@@ -1,0 +1,839 @@
+##############################################################################
+# IMA - Import Declaration Automation
+# Power Automate Desktop (PAD) flow
+#
+# This file is sanitised for portfolio purposes:
+# - All UI element selectors replaced with [ELEMENT] / [WEB_ELEMENT]
+# - Personal paths replaced with YOUR_USERNAME / YOUR_COMPANY / YOUR_SERVER
+# - Credentials replaced with placeholders
+# - Company-specific authorisation numbers replaced with AUTH_NUMBER_x
+##############################################################################
+
+# ─── PHASE 1: DATE SETUP ────────────────────────────────────────────────────
+
+DateTime.GetCurrentDateTime.Local DateTimeFormat: DateTime.DateTimeFormat.DateOnly CurrentDateTime=> CurrentDateTime
+Text.ConvertDateTimeToText.FromDateTime DateTime: CurrentDateTime StandardFormat: Text.WellKnownDateTimeFormat.ShortDate Result=> FormattedDateTime
+Text.Replace.ReplaceTextWithRegex Text: FormattedDateTime TextToFind: $'''/''' IgnoreCase: False ReplaceWith: $'''.''' ActivateEscapeSequences: True Result=> Replaced
+
+DateTime.Add DateTime: CurrentDateTime TimeToAdd: -1 TimeUnit: DateTime.TimeUnit.Months ResultedDate=> ResultedDate
+Text.ConvertDateTimeToText.FromCustomDateTime DateTime: ResultedDate CustomFormat: $'''dd''' Result=> day
+Text.ConvertDateTimeToText.FromCustomDateTime DateTime: ResultedDate CustomFormat: $'''MM''' Result=> month
+Text.ConvertDateTimeToText.FromCustomDateTime DateTime: ResultedDate CustomFormat: $'''yyyy''' Result=> year
+Text.ToNumber Text: month Number=> month2
+
+IF month2 <> 1 THEN
+    SET ordinal TO 0
+ELSE
+    SET ordinal TO 1
+END
+
+# ─── PHASE 2: SAP EXPORT (LIST_N) ───────────────────────────────────────────
+# Opens SAP shortcut, authenticates, sets the date range to the full previous
+# month, runs the import declaration report and exports to Excel.
+
+System.RunApplication.RunApplication ApplicationPath: $'''C:\Users\YOUR_USERNAME\Desktop\LIST_N.sap''' WindowStyle: System.ProcessWindowStyle.Maximized ProcessId=> AppProcessId
+
+UIAutomation.PopulateTextField.PopulateTextField TextField: [ELEMENT] Text: ENCRYPTED_SAP_PASSWORD Mode: UIAutomation.PopulateTextMode.Append ClickType: UIAutomation.PopulateMouseClickType.DoubleClick
+ON ERROR REPEAT 1 TIMES WAIT 2
+ON ERROR
+    REPEAT ACTION
+END
+
+MouseAndKeyboard.SendKeys.FocusAndSendKeysByControl Control: [ELEMENT] TextToSend: $'''{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+UIAutomation.SetWindowState.SetState Window: [ELEMENT] State: UIAutomation.WindowState.Maximized
+ON ERROR
+    REPEAT ACTION
+END
+
+WAIT 1
+# Fill date range: 01.MM.YYYY to today, company code 1100
+MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}01.%month%.%year%{Tab}%Replaced%{Tab}{Tab}{Tab}{Tab}{Tab}1100''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+UIAutomation.PressButton Button: [ELEMENT]  # Execute
+ON ERROR
+    REPEAT ACTION
+END
+
+WAIT (UIAutomation.WaitForWindow.ToOpen Window: [ELEMENT] FocusWindow: False)
+
+# Export to Excel: Layout -> Export -> Spreadsheet
+MouseAndKeyboard.SendMouseClick.ClickAt ClickType: MouseAndKeyboard.MouseClickType.LeftClick MillisecondsDelay: 0 X: 51 Y: 21 RelativeTo: MouseAndKeyboard.PositionRelativeTo.Screen MovementStyle: MouseAndKeyboard.MovementStyle.Instant
+ON ERROR
+    REPEAT ACTION
+END
+
+MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Down}{Down}{Down}{Right}{Down}{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+UIAutomation.PressButton Button: [ELEMENT]  # Continue
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.PressButton Button: [ELEMENT]  # Desktop
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.PressButton Button: [ELEMENT]  # Select ΕΙΣΑΓΩΓΕΣ_database file
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.PressButton Button: [ELEMENT]  # Save
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.PressButton Button: [ELEMENT]  # Yes (overwrite)
+ON ERROR
+    REPEAT ACTION
+END
+
+WAIT (UIAutomation.WaitForWindow.ToOpen Window: [ELEMENT] FocusWindow: False)
+UIAutomation.CloseWindow.Close Window: [ELEMENT]
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.CloseWindow.CloseByTitleClass Title: $'''''' Class: $'''SAP_FRONTEND_SESSION'''
+ON ERROR
+    REPEAT ACTION
+END
+
+# ─── PHASE 3: ICISNET PDF DOWNLOAD ──────────────────────────────────────────
+# Opens ICISNET (Greek Customs web portal), sets search scope, applies the
+# date range for the previous month, runs the search and prints results to PDF.
+
+DateTime.GetCurrentDateTime.Local DateTimeFormat: DateTime.DateTimeFormat.DateOnly CurrentDateTime=> CurrentDateTime
+Text.ConvertDateTimeToText.FromDateTime DateTime: CurrentDateTime StandardFormat: Text.WellKnownDateTimeFormat.ShortDate Result=> FormattedDateTime
+Text.Replace.ReplaceTextWithRegex Text: FormattedDateTime TextToFind: $'''/''' IgnoreCase: False ReplaceWith: $'''.''' ActivateEscapeSequences: True Result=> Replaced
+DateTime.Add DateTime: CurrentDateTime TimeToAdd: -1 TimeUnit: DateTime.TimeUnit.Months ResultedDate=> ResultedDate
+Text.ConvertDateTimeToText.FromCustomDateTime DateTime: ResultedDate CustomFormat: $'''MM''' Result=> month
+Text.ConvertDateTimeToText.FromCustomDateTime DateTime: ResultedDate CustomFormat: $'''yyyy''' Result=> year
+Text.ToNumber Text: month Number=> month2
+IF month2 <> 1 THEN
+    SET ordinal TO 0
+ELSE
+    SET ordinal TO 1
+END
+Text.ToNumber Text: month Number=> month
+Text.ToNumber Text: day Number=> day
+
+SET Url TO $'''https://www1.gsis.gr/icisnet/itrader/common/home.jsf'''
+WebAutomation.LaunchChrome.LaunchChrome Url: Url WindowState: WebAutomation.BrowserWindowState.Maximized ClearCache: False ClearCookies: False WaitForPageToLoadTimeout: 60 Timeout: 60 BrowserInstance=> Browser
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.PressButton.PressButton BrowserInstance: Browser Control: [WEB_ELEMENT]  # Search button
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.LaunchChrome.AttachToChromeByUrl TabUrl: 'https://www1.gsis.gr/icisnet/itrader/common/home.jsf' AttachTimeout: 10 BrowserInstance=> Browser
+
+# Set scope: Συναλλασσόμενος
+WebAutomation.SetDropDownListValue.SetDropDownListValueByName BrowserInstance: Browser Control: [WEB_ELEMENT] OptionNames: ['Συναλλασσόμενος'] UseRegularExpression: False WaitForPageToLoadTimeout: 60
+ON ERROR
+    REPEAT ACTION
+END
+
+# Set archive: Όλα
+WebAutomation.SetDropDownListValue.SetDropDownListValueByName BrowserInstance: Browser Control: [WEB_ELEMENT] OptionNames: ['Όλα'] UseRegularExpression: False WaitForPageToLoadTimeout: 60
+ON ERROR
+    REPEAT ACTION
+END
+
+# Open date picker and set start date to 01/MM/YYYY
+WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Calendar icon
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Navigate to month
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Select year
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Select month
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Day 1
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # OK
+ON ERROR
+    REPEAT ACTION
+END
+
+# Submit search
+WebAutomation.PressButton.PressButton BrowserInstance: Browser Control: [WEB_ELEMENT]  # Submit
+ON ERROR
+    REPEAT ACTION
+END
+
+# Print results to PDF (Ctrl+P -> Save)
+WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Print results link
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.LaunchChrome.AttachToChromeByUrl TabUrl: $'''https://www1.gsis.gr/icisnet/itrader/ics/icsCreateImportDec/search.jsf''' AttachTimeout: 10 BrowserInstance=> Browser_2
+ON ERROR
+    REPEAT ACTION
+END
+
+WAIT (WebAutomation.WaitForWebPageContent.WebPageToContainText BrowserInstance: Browser_2 Text: $'''Αποτελέσματα Αναζήτησης''')
+ON ERROR
+    REPEAT ACTION
+END
+
+MouseAndKeyboard.SendKeys.FocusAndSendKeysByInstanceOrHandle WindowInstance: Browser_2 TextToSend: $'''{LControlKey}({P})''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+ON ERROR
+    REPEAT ACTION
+END
+
+WAIT 1
+MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Enter}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.Click.Click Element: [ELEMENT]  # Desktop (pinned) in save dialog
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.PressButton Button: [ELEMENT]  # Save
+ON ERROR
+    REPEAT ACTION
+END
+
+UIAutomation.PressButton Button: [ELEMENT]  # Yes (overwrite)
+ON ERROR
+    REPEAT ACTION
+END
+
+WAIT 1
+WebAutomation.CloseWebBrowser BrowserInstance: Browser
+ON ERROR
+    REPEAT ACTION
+END
+
+WebAutomation.CloseWebBrowser BrowserInstance: Browser_2
+ON ERROR
+    REPEAT ACTION
+END
+
+# ─── PHASE 4: POWER QUERY ENGINE — FIND NEW DECLARATIONS ────────────────────
+# Opens the Excel workbook that contains the Power Query engine.
+# Refreshes all queries (Ctrl+Alt+F5):
+#   - "opened" sheet: compares ICISNET PDF data vs SAP export → returns only
+#     declarations not yet posted in SAP (new MRNs to process).
+# Reads the resulting table into ExcelData.
+
+MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{LShiftKey}({Alt}(1))''' DelayBetweenKeystrokes: 1 SendTextAsHardwareKeys: True
+ON ERROR
+    REPEAT ACTION
+END
+
+SET ExcelPath TO $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Desktop\IMA_ENGINE.xlsx'''
+Excel.LaunchExcel.LaunchAndOpenUnderExistingProcess Path: ExcelPath Visible: True ReadOnly: False Instance=> ExcelInstance
+ON ERROR
+    REPEAT ACTION
+END
+
+MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Control}({Alt}({F5}))''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+Excel.SetActiveWorksheet.ActivateWorksheetByName Instance: ExcelInstance Name: $'''opened'''
+WAIT 0.5
+
+Excel.GetFirstFreeColumnRow Instance: ExcelInstance FirstFreeColumn=> FirstFreeColumn FirstFreeRow=> FirstFreeRow
+ON ERROR
+    REPEAT ACTION
+END
+
+Excel.ReadFromExcel.ReadCells Instance: ExcelInstance StartColumn: $'''A''' StartRow: 1 EndColumn: $'''K''' EndRow: FirstFreeRow - 1 FirstLineIsHeader: True GetCellContentsMode: Excel.GetCellContentsMode.FormattedTextValues RangeValue=> ExcelData
+Excel.CloseExcel.CloseAndSave Instance: ExcelInstance
+
+# ─── PHASE 5: MAIN LOOP — PROCESS EACH NEW DECLARATION ──────────────────────
+
+LOOP FOREACH CurrentItem IN ExcelData
+    IF IsNotEmpty(CurrentItem['MRN']) THEN
+
+        # ── 5a. ICISNET: SEARCH BY MRN ──────────────────────────────────────
+        # Searches the AADE message portal for the declaration XML (message type ID29)
+
+        SET Url TO $'''https://www1.gsis.gr/icisnet/itrader/common/home.jsf'''
+        WebAutomation.LaunchChrome.LaunchChrome Url: Url WindowState: WebAutomation.BrowserWindowState.Maximized ClearCache: False ClearCookies: False WaitForPageToLoadTimeout: 60 Timeout: 60 BrowserInstance=> Browser
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WebAutomation.PressButton.PressButton BrowserInstance: Browser Control: [WEB_ELEMENT]  # Αναζήτηση Μηνυμάτων
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WebAutomation.PopulateTextField.PopulateTextFieldUsePhysicalKeyboard BrowserInstance: Browser Control: [WEB_ELEMENT] Text: CurrentItem['MRN'] Mode: WebAutomation.PopulateTextMode.Replace UnfocusAfterPopulate: False WaitForPageToLoadTimeout: 60
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WebAutomation.SetDropDownListValue.SetDropDownListValueByName BrowserInstance: Browser Control: [WEB_ELEMENT] OptionNames: ['Εισαγωγές'] UseRegularExpression: False WaitForPageToLoadTimeout: 60
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WebAutomation.SetDropDownListValue.SetDropDownListValueByName BrowserInstance: Browser Control: [WEB_ELEMENT] OptionNames: ['ID29'] UseRegularExpression: False WaitForPageToLoadTimeout: 60
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WebAutomation.SetDropDownListValue.SetDropDownListValueByName BrowserInstance: Browser Control: [WEB_ELEMENT] OptionNames: ['Συναλλασσόμενος'] UseRegularExpression: False WaitForPageToLoadTimeout: 60
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WebAutomation.PressButton.PressButton BrowserInstance: Browser Control: [WEB_ELEMENT]  # Search
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # ID29 result link
+        ON ERROR
+            REPEAT ACTION
+        END
+
+        WAIT 2
+
+        # ── 5b. READ CUSTOMS REGIME AND COMMODITY CODE FROM XML VIEWER ───────
+        # Uses Ctrl+F to find specific fields in the XML viewer and copies their
+        # values to the clipboard for routing decisions.
+
+        Clipboard.Clear _
+        LABEL R
+        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Control}({F})Καθεστώς{Escape}''' DelayBetweenKeystrokes: 12 SendTextAsHardwareKeys: False
+        WAIT 0.5
+        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Shift}({Right}{Right}{Right}){Control}({C})''' DelayBetweenKeystrokes: 12 SendTextAsHardwareKeys: False
+        WAIT 0.5
+        Clipboard.GetText Text=> ClipboardText
+        ON ERROR
+            REPEAT ACTION
+        END
+        Text.GetSubtext.GetSubtextFrom Text: ClipboardText CharacterPosition: 9 Subtext=> Subtext
+        ON ERROR
+            GOTO R
+        END
+        Text.Trim Text: Subtext TrimOption: Text.TrimOption.Both TrimmedText=> AttributeValue2
+
+        # Regime 71 = Transit → skip this declaration
+        IF AttributeValue2 = 71 THEN
+            WebAutomation.CloseWebBrowser BrowserInstance: Browser
+            ON ERROR
+                REPEAT ACTION
+            END
+            GOTO T
+        END
+
+        WAIT 0.5
+        Clipboard.Clear _
+        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Control}({F})Κωδικός Εμπορευμάτων{Return}{Escape}''' DelayBetweenKeystrokes: 12 SendTextAsHardwareKeys: False
+        WAIT 0.5
+        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Shift}({Right}{Right}{Right}{Right}{Right}{Right}{Right}{Right}{Right}){Control}({C})''' DelayBetweenKeystrokes: 12 SendTextAsHardwareKeys: False
+        WAIT 0.5
+        Clipboard.GetText Text=> ClipboardText
+        ON ERROR
+            REPEAT ACTION
+        END
+        WAIT 0.5
+        Text.GetSubtext.GetSubtextFrom Text: ClipboardText CharacterPosition: 20 Subtext=> Subtext
+        ON ERROR
+            GOTO R
+        END
+        Text.Trim Text: Subtext TrimOption: Text.TrimOption.Both TrimmedText=> AttributeValue
+
+    END
+
+    LABEL T
+
+    # ── 5c. COMMODITY FILTER + XML DOWNLOAD ─────────────────────────────────
+    # Only processes declarations for relevant commodity codes:
+    # 76xx = Aluminium, 72xx = Steel/Iron, 81xx = Other base metals,
+    # 280469x = Industrial gases, 271011x = Mineral oils
+
+    IF AttributeValue2 <> 71 THEN
+        IF (StartsWith(AttributeValue, '76') OR StartsWith(AttributeValue, '72') OR StartsWith(AttributeValue, '81') OR StartsWith(AttributeValue, '2804690') OR StartsWith(AttributeValue, '2710112')) = $'''TRUE''' THEN
+
+            # Open "Ενέργειες" menu and download XML
+            WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Ενέργειες menu
+            ON ERROR
+                REPEAT ACTION
+            END
+
+            WebAutomation.Click.Click BrowserInstance: Browser Control: [WEB_ELEMENT]  # Αποθήκευση ως XML
+            ON ERROR
+                REPEAT ACTION
+            END
+
+            WAIT 2
+
+            # In the save-as dialog: navigate to Desktop and save as xml.xml
+            UIAutomation.PressButton Button: [ELEMENT]  # Desktop (pinned)
+            ON ERROR
+                REPEAT ACTION
+            END
+
+            # Rename existing PDF to match MRN format before saving XML
+            File.RenameFiles.Rename Files: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['PDF.1']%.pdf''' NewName: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['PDF']%''' KeepExtension: True IfFileExists: File.IfExists.DoNothing RenamedFiles=> RenamedFiles
+            ON ERROR
+                REPEAT ACTION
+            END
+
+            UIAutomation.PopulateTextField.PopulateTextField TextField: [ELEMENT] Text: $'''xml.xml''' Mode: UIAutomation.PopulateTextMode.Replace ClickType: UIAutomation.PopulateMouseClickType.SingleClick
+            ON ERROR
+                REPEAT ACTION
+            END
+
+            WAIT 2
+            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: '{Return}'
+            WAIT 1.5
+            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Left}{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+            WAIT 5
+
+            WebAutomation.CloseWebBrowser BrowserInstance: Browser
+            ON ERROR
+                REPEAT ACTION
+            END
+            WAIT 1
+
+            # ── 5d. POWER QUERY: READ XML DATA ───────────────────────────────
+            # Refreshes the "info" sheet which reads xml.xml and extracts all
+            # declaration line items: customs office, type, MRN, date, commodity
+            # code, statistical value, weight, duty, VAT, authorisation dates, etc.
+            # Loops until the PQ result matches the current MRN.
+
+            SET ExcelPath TO $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Desktop\IMA_ENGINE.xlsx'''
+            Excel.LaunchExcel.LaunchAndOpenUnderExistingProcess Path: ExcelPath Visible: True ReadOnly: False Instance=> ExcelInstance
+            Excel.SetActiveWorksheet.ActivateWorksheetByName Instance: ExcelInstance Name: $'''info'''
+            WAIT 0.5
+            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Control}({Alt}({F5}))''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+            LABEL H
+            Excel.ReadFromExcel.ReadCell Instance: ExcelInstance StartColumn: $'''C''' StartRow: 2 GetCellContentsMode: Excel.GetCellContentsMode.FormattedTextValues CellValue=> MRN
+            ON ERROR
+                REPEAT ACTION
+            END
+            IF MRN <> CurrentItem['MRN'] THEN
+                GOTO H
+            END
+
+            Excel.GetFirstFreeColumnRow Instance: ExcelInstance FirstFreeColumn=> FirstFreeColumn FirstFreeRow=> FirstFreeRow
+            Excel.ReadFromExcel.ReadCells Instance: ExcelInstance StartColumn: $'''A''' StartRow: 1 EndColumn: $'''AC''' EndRow: FirstFreeRow - 1 FirstLineIsHeader: True GetCellContentsMode: Excel.GetCellContentsMode.FormattedTextValues RangeValue=> ExcelData2
+            Excel.CloseExcel.CloseAndSave Instance: ExcelInstance
+            ON ERROR
+                REPEAT ACTION
+            END
+
+            # ── 5e. SAP ENTRY LOOP (one iteration per declaration line) ───────
+            LOOP FOREACH CurrentItem2 IN ExcelData2
+
+                Workstation.ShowDesktop DesktopOperation: System.DesktopOperation.Show
+
+                LABEL W
+                WAIT 0.5
+
+                # Open SAP import posting transaction (ZELVMM_IMP_1)
+                System.RunApplication.RunApplication ApplicationPath: $'''C:\Users\YOUR_USERNAME\Desktop\ZELVMM_IMP_1.sap''' WindowStyle: System.ProcessWindowStyle.Maximized ProcessId=> AppProcessId
+                WAIT 2.5
+
+                # Authenticate and navigate to company code 1100
+                MouseAndKeyboard.SendKeys.FocusAndSendKeysByControl Control: [ELEMENT] TextToSend: $'''YOUR_SAP_PASSWORD{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 5
+
+                MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Tab}{Tab}{Space}{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                WAIT 1
+                MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''1100{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+                UIAutomation.SetWindowState.SetState Window: [ELEMENT] State: UIAutomation.WindowState.Maximized
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 1
+
+                UIAutomation.PressButton Button: [ELEMENT]  # Εμφάνιση -> Αλλαγή
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 1
+
+                # If layout selection dialog opens, restart SAP session
+                IF (UIAutomation.IfWindow.IsOpen Window: [ELEMENT]) THEN
+                    UIAutomation.CloseWindow.CloseByTitleClass Title: $'''''' Class: $'''SAP_FRONTEND_SESSION'''
+                    GOTO W
+                END
+
+                WAIT 1
+                UIAutomation.PressButton Button: [ELEMENT]  # Νέες Καταχωρίσεις
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 2
+
+                # ── 5f. TYPE IN DECLARATION HEADER FIELDS ────────────────────
+                # Customs office (ΤΕΛΩΝ), declaration type (ΤΥΠΟΣ), MRN (x2),
+                # date (x2), commodity code (ΔΑΣΜ_ΚΛ), company code 1100,
+                # line serial number (Α/Α), country of origin (ΧΩΡΑ).
+                # Note: customs office 0832 has a different tab layout.
+
+                IF CurrentItem2['ΤΕΛΩΝ'] <> $'''0832''' THEN
+                    MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%CurrentItem2['ΤΕΛΩΝ']%{Tab}%CurrentItem2['ΤΕΛΩΝ']%{Tab}%CurrentItem2['ΤΥΠΟΣ']%{Tab}{Tab}%CurrentItem2['MRN']%{Tab}%CurrentItem2['MRN']%{Tab}{Tab}%CurrentItem2['ΗΜΕΡ']%{Tab}%CurrentItem2['ΗΜΕΡ']%{Tab}{Tab}%CurrentItem2['ΔΑΣΜ_ΚΛ']%{Tab}{Tab}1100{Tab}%CurrentItem2['Α/Α']%{Tab}%CurrentItem2['ΧΩΡΑ']%{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                ELSE
+                    MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%CurrentItem2['ΤΕΛΩΝ']%{Tab}{Tab}%CurrentItem2['ΤΥΠΟΣ']%{Tab}{Tab}%CurrentItem2['MRN']%{Tab}{Tab}{Tab}%CurrentItem2['ΗΜΕΡ']%{Tab}{Tab}{Tab}%CurrentItem2['ΔΑΣΜ_ΚΛ']%{Tab}{Tab}1100{Tab}%CurrentItem2['Α/Α']%{Tab}%CurrentItem2['ΧΩΡΑ']%{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                END
+
+                # ── 5g. CUSTOMS REGIME ROUTING ───────────────────────────────
+                # Regime codes:
+                #   X16 flag  → 3  (ΦΠΑ Exemption / ΑΠΑΛΛΑΓΗ ΦΠΑ)
+                #   ΤΕΛ_ΚΑΘ 5111 → 12 (Inward Processing - INF / ΕΝΕΡΓΗΤΙΚΗ-INF)
+                #   ΤΕΛ_ΚΑΘ 5xxx → 2  (Inward Processing / ΕΝΕΡΓΗΤΙΚΗ)
+                #   else         → 5  (Free Circulation / ΕΛΕΥΘΕΡΑ)
+
+                IF CurrentItem2['X16'] = $'''X16''' THEN
+                    SET Userinput TO 3
+                ELSE IF CurrentItem2['ΤΕΛ_ΚΑΘ'] = 5111 THEN
+                    SET Userinput TO 12
+                ELSE IF StartsWith(CurrentItem2['ΤΕΛ_ΚΑΘ'], 5, False) THEN
+                    SET Userinput TO 2
+                ELSE
+                    SET Userinput TO 5
+                END
+
+                MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%UserInput%{Tab}%CurrentItem2['ΤΕΛ_ΚΑΘ']%{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+                # ── 5h. SPECIAL SUPPLIER HANDLING ───────────────────────────
+                # One supplier (SUPPLIER_NAME) under specific conditions uses
+                # a passive processing authorisation (AUTH_NUMBER_PASSIVE) and
+                # requires additional alloy weight fields filled manually.
+
+                IF (UserInput = 3 AND CurrentItem2['ΤΕΛ_ΚΑΘ'] = 6121 AND CurrentItem2['ΠΡΟΜ'] = 'SUPPLIER_NAME' AND CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76012080) = $'''TRUE''' THEN
+                    MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{LShiftKey}({Alt}(1))''' DelayBetweenKeystrokes: 1 SendTextAsHardwareKeys: True
+                    ON ERROR
+                        REPEAT ACTION
+                    END
+                    WAIT 2
+                    MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%CurrentItem2['ΗΜΕΡ_ΛΗΞΗΣ']%{Tab}{Tab}{Tab}{Tab}{Tab}AUTH_NUMBER_PASSIVE{Tab}%CurrentItem2['ΒΑΡΟΣ']%{Tab}KG{Tab}%CurrentItem2['ΣΤΑΤ_ΑΞΙΑ']%{Tab}%CurrentItem2['ΝΟΜ_ΣΤΑΤ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Space}{Tab}{Tab}SUPPLIER_NAME - ΠΑΘΗΤΙΚΗ ΤΕΛ.{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}AUTH_DECISION_PASSIVE{Tab}{Tab}AL{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}
+''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                ELSE
+                    # ── 5i. STANDARD AUTHORISATION FIELDS ───────────────────
+                    # Fills expiry date (ΗΜΕΡ_ΛΗΞΗΣ), authorisation numbers,
+                    # weight, statistical value, currency, duty, VAT by regime.
+
+                    IF UserInput = 3 THEN
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%CurrentItem2['ΗΜΕΡ_ΛΗΞΗΣ']%{Tab}{Tab}{Tab}{Tab}{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                    ELSE IF UserInput = 5 THEN
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Tab}{Tab}{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                    ELSE IF UserInput = 12 THEN
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Tab}{Tab}{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                    ELSE
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%CurrentItem2['ΗΜΕΡ_ΛΗΞΗΣ2']%{Tab}{Tab}{Tab}{Tab}{Tab}AUTH_NUMBER_IP''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                    END
+
+                    MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}%CurrentItem2['ΒΑΡΟΣ']%{Tab}KG{Tab}%CurrentItem2['ΣΤΑΤ_ΑΞΙΑ']%{Tab}%CurrentItem2['ΝΟΜ_ΣΤΑΤ']%{Tab}{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+                    # Alloy type 24 (scrap/waste) requires a special fiscal year field
+                    IF CurrentItem2['ΣΥΝΤ_ΔΑΣΜ'] = 24 THEN
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{LShiftKey}({Alt}(1))''' DelayBetweenKeystrokes: 1 SendTextAsHardwareKeys: True
+                        ON ERROR
+                            REPEAT ACTION
+                        END
+                        SET CurrentItem2['ΠΡΟΜ'] TO $'''ΦΥΡΑ - ΕΚΚΑΘΑΡΙΣΗ %CurrentItem2['ΗΜΕΡ']%'''
+                    END
+
+                    # C-type declarations (supplementary) use different guarantee numbers
+                    IF EndsWith(CurrentItem2['ΤΥΠΟΣ'], $'''C''', False) THEN
+                        IF UserInput = 2 THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''AUTH_NUMBER_IP_CGU{Tab}{Tab}AUTH_NUMBER_BOND_IP{Tab}{Space}{Tab}AUTH_NUMBER_SASP_IP{Tab}%CurrentItem2['ΠΡΟΜ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}%CurrentItem2['ΗΜΕΡ_ΠΡΟΘ']%{Tab}{Tab}AUTH_DECISION_IP''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        ELSE IF UserInput = 3 THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''AUTH_NUMBER_X16_CGU{Tab}{Tab}AUTH_NUMBER_BOND_X16{Tab}{Space}{Tab}AUTH_NUMBER_SASP_X16{Tab}%CurrentItem2['ΠΡΟΜ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}AUTH_DECISION_X16''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        ELSE IF UserInput = 5 THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''AUTH_NUMBER_X16_CGU{Tab}{Tab}AUTH_NUMBER_BOND_X16{Tab}{Space}{Tab}AUTH_NUMBER_SASP_X16{Tab}%CurrentItem2['ΠΡΟΜ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}.''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        END
+                    ELSE
+                        IF UserInput = 2 THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''AUTH_NUMBER_IP_CGU{Tab}{Tab}AUTH_NUMBER_BOND_IP{Tab}{Space}{Tab}{Tab}%CurrentItem2['ΠΡΟΜ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}%CurrentItem2['ΗΜΕΡ_ΠΡΟΘ']%{Tab}{Tab}AUTH_DECISION_IP''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        ELSE IF UserInput = 3 THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Tab}{Space}{Tab}{Tab}%CurrentItem2['ΠΡΟΜ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}AUTH_DECISION_X16''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        ELSE IF UserInput = 5 THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Tab}{Space}{Tab}{Tab}%CurrentItem2['ΠΡΟΜ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}.''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        ELSE IF UserInput = 12 THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Tab}{Space}{Tab}{Tab}%CurrentItem2['ΠΡΟΜ']%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}.''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        END
+                    END
+
+                    # ── 5j. ALLOY TYPE AND WEIGHT FIELDS ────────────────────
+                    # Known commodity codes auto-map to alloy codes:
+                    #   76020019 → SCRAP | 76011090 → 1XXX | 76012080/030 → AL
+                    #   81041100 → MG    | 81110011 → MN   | 720529xx → FE
+                    # Unknown codes prompt the operator for alloy code(s) and
+                    # weight(s). Supports up to 3 alloys per declaration.
+
+                    IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76020019 THEN
+                        SET UserInput6 TO 1
+                    ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76012030 THEN
+                        SET UserInput6 TO 1
+                    ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76012080 THEN
+                        SET UserInput6 TO 1
+                    ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76011090 THEN
+                        SET UserInput6 TO 1
+                    ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 81041100 THEN
+                        SET UserInput6 TO 1
+                    ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 81110011 THEN
+                        SET UserInput6 TO 1
+                    ELSE IF (CurrentItem2['ΔΑΣΜ_ΚΛ'] = 72052900 OR CurrentItem2['ΔΑΣΜ_ΚΛ'] = 72069000 OR CurrentItem2['ΔΑΣΜ_ΚΛ'] = 72029980) = $'''TRUE''' THEN
+                        SET UserInput6 TO 1
+                    ELSE
+                        # Unknown code — ask operator how many alloys (1, 2 or 3)
+                        LABEL A
+                        Display.InputDialog Title: $'''ΠΟΣΑ ΚΡΑΜΜΑΤΑ ΕΙΧΕ Η ΔΙΑΣΑΦΗΣΗ;''' Message: $'''ΠΟΣΑ ΚΡΑΜΜΑΤΑ ΕΙΧΕ Η ΔΙΑΣΑΦΗΣΗ;''' DefaultValue: 1 InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput6 ButtonPressed=> ButtonPressed6
+                        IF (ButtonPressed6 = 'OK') = $'''False''' THEN
+                            GOTO A
+                        END
+                        IF (UserInput6 = '1' OR UserInput6 = '2' OR UserInput6 = '3') = $'''False''' THEN
+                            GOTO A
+                        END
+                    END
+
+                    IF UserInput6 = 1 THEN
+                        IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76020019 THEN
+                            IF CurrentItem2['ΣΥΝΤ_ΔΑΣΜ'] = 24 THEN
+                                SET UserInput2 TO $'''SCRAP-ΦΥΡΑ'''
+                            ELSE
+                                SET UserInput2 TO $'''SCRAP'''
+                            END
+                        ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76011090 THEN
+                            SET UserInput2 TO $'''1XXX'''
+                        ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76012080 THEN
+                            SET UserInput2 TO $'''AL'''
+                        ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76012030 THEN
+                            SET UserInput2 TO $'''AL'''
+                        ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 81041100 THEN
+                            SET UserInput2 TO $'''MG'''
+                        ELSE IF CurrentItem2['ΔΑΣΜ_ΚΛ'] = 81110011 THEN
+                            SET UserInput2 TO $'''MN'''
+                        ELSE IF (CurrentItem2['ΔΑΣΜ_ΚΛ'] = 72052900 OR CurrentItem2['ΔΑΣΜ_ΚΛ'] = 72069000 OR CurrentItem2['ΔΑΣΜ_ΚΛ'] = 72029980) = $'''TRUE''' THEN
+                            SET UserInput2 TO $'''FE'''
+                        ELSE
+                            LABEL B
+                            Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ''' DefaultValue: 1200 InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput2 ButtonPressed=> ButtonPressed2
+                            IF (ButtonPressed2 = 'Cancel' OR ButtonPressed3 = 'Cancel') = $'''True''' THEN
+                                GOTO B
+                            END
+                        END
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}%UserInput2%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+                    ELSE IF UserInput6 = 2 THEN
+                        # 2 alloys — prompt for each alloy code and weight
+                        LABEL C
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput2 ButtonPressed=> ButtonPressed2
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput3 ButtonPressed=> ButtonPressed3
+                        IF (ButtonPressed3 = 'Cancel' OR ButtonPressed2 = 'Cancel') = $'''True''' THEN
+                            GOTO C
+                        END
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}%UserInput2%{Tab}%UserInput3%''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        LABEL G
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ 2''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ 2''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput4 ButtonPressed=> ButtonPressed4
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ 2''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ 2''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput5 ButtonPressed=> ButtonPressed5
+                        IF (ButtonPressed4 = 'Cancel' OR ButtonPressed5 = 'Cancel') = $'''True''' THEN
+                            GOTO G
+                        END
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}%UserInput4%{Tab}%UserInput5%{Tab}{Tab}{Tab}{Tab}{Tab}{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+                    ELSE
+                        # 3 alloys — prompt for each alloy code and weight
+                        LABEL D
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput2 ButtonPressed=> ButtonPressed2
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput3 ButtonPressed=> ButtonPressed3
+                        IF (ButtonPressed3 = 'Cancel' OR ButtonPressed2 = 'Cancel') = $'''True''' THEN
+                            GOTO D
+                        END
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}%UserInput2%{Tab}%UserInput3%''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        LABEL E
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ 2''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ 2''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput4 ButtonPressed=> ButtonPressed4
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ 2''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ 2''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput5 ButtonPressed=> ButtonPressed5
+                        IF (ButtonPressed4 = 'Cancel' OR ButtonPressed5 = 'Cancel') = $'''True''' THEN
+                            GOTO E
+                        END
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}%UserInput4%{Tab}%UserInput5%''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        LABEL F
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ 3''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΡΑΜΜΑΤΟΣ 3''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput7 ButtonPressed=> ButtonPressed7
+                        Display.InputDialog Title: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ 3''' Message: $'''ΕΙΣΑΓΩΓΗ ΚΙΛΩΝ ΚΡΑΜΜΑΤΟΣ 3''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput8 ButtonPressed=> ButtonPressed8
+                        IF (ButtonPressed7 = 'Cancel' OR ButtonPressed8 = 'Cancel') = $'''True''' THEN
+                            GOTO F
+                        END
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}%UserInput7%{Tab}%UserInput8%{Tab}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                    END
+                END
+
+                # ── 5k. TARIFF PREFERENCE + DUTY/VAT FIELDS ─────────────────
+                IF IsEmpty(CurrentItem['ΠΡΟΤ']) THEN
+                    Display.InputDialog Title: $'''ΕΙΣΑΓΕΤΕ ΠΡΟΤΙΜΗΣΗ''' Message: $'''ΕΙΣΑΓΕΤΕ ΠΡΟΤΙΜΗΣΗ''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput10 ButtonPressed=> ButtonPressed11
+                ELSE
+                    SET UserInput10 TO CurrentItem['ΠΡΟΤ']
+                END
+
+                # Passive processing (special supplier) uses a different SAP tab
+                IF (UserInput = 3 AND CurrentItem2['ΤΕΛ_ΚΑΘ'] = 6121 AND CurrentItem2['ΠΡΟΜ'] = 'SUPPLIER_NAME' AND CurrentItem2['ΔΑΣΜ_ΚΛ'] = 76012080) = $'''TRUE''' THEN
+                    UIAutomation.Click.Click Element: [ELEMENT]  # Extra tab for passive processing
+                    ON ERROR
+                        REPEAT ACTION
+                    END
+                END
+
+                # Scrap/waste: terms, price, currency, exchange rate, statistical value, VAT only
+                IF CurrentItem2['ΣΥΝΤ_ΔΑΣΜ'] = 24 THEN
+                    MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%UserInput10%{Tab}{Tab}%CurrentItem2['ΟΡΟΙ']%{Tab}%CurrentItem2['ΤΙΜΗ']%{Tab}{Tab}%CurrentItem2['ΝΟΜ_ΙΣΟΤ']%{Tab}{Tab}%CurrentItem2['ΙΣΟΤ']%{Tab}{Tab}%CurrentItem2['ΣΤΑΤ_ΑΞΙΑ']%{Tab}{Tab}{Tab}{Tab}{Tab}%CurrentItem2['ΣΥΝΤ_ΦΠΑ']%{Tab}{Tab}%CurrentItem2['ΦΠΑ']%''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                ELSE
+                    # Standard: terms, price, currency, exchange rate, statistical value,
+                    # customs duty rate (ΣΥΝΤ_ΔΑΣΜ) + amount (ΔΑΣΜ), VAT rate + amount
+                    MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%UserInput10%{Tab}{Tab}%CurrentItem2['ΟΡΟΙ']%{Tab}%CurrentItem2['ΤΙΜΗ']%{Tab}{Tab}%CurrentItem2['ΝΟΜ_ΙΣΟΤ']%{Tab}{Tab}%CurrentItem2['ΙΣΟΤ']%{Tab}{Tab}%CurrentItem2['ΣΤΑΤ_ΑΞΙΑ']%{Tab}{Tab}%CurrentItem2['ΣΥΝΤ_ΔΑΣΜ']%{Tab}%CurrentItem2['ΔΑΣΜ']%{Tab}{Tab}%CurrentItem2['ΣΥΝΤ_ΦΠΑ']%{Tab}{Tab}%CurrentItem2['ΦΠΑ']%''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+
+                    # Import order (ΕΝΤ_ΑΓ): auto-fill if present, else prompt operator
+                    IF IsEmpty(CurrentItem2['ΕΝΤ_ΑΓ']) THEN
+                        LABEL L
+                        Display.InputDialog Title: $'''ΣΥΜΠΛΗΡΩΣΤΕ ΤΑ ΤΕΛΕΥΤΑΙΑ 5 ΨΗΦΙΑ ΤΗΣ ΕΝΤΟΛΗΣ ΕΙΣΑΓΩΓΗΣ''' Message: $'''ΣΥΜΠΛΗΡΩΣΤΕ ΤΑ ΤΕΛΕΥΤΑΙΑ 5 ΨΗΦΙΑ ΤΗΣ ΕΝΤΟΛΗΣ ΕΙΣΑΓΩΓΗΣ''' InputType: Display.InputType.SingleLine IsTopMost: False UserInput=> UserInput9 ButtonPressed=> ButtonPressed9
+                        IF (UserInput9.Length = '5' AND ButtonPressed9 = 'OK') = $'''TRUE''' THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}41000%UserInput9%{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        ELSE IF (UserInput9 = 'NO' OR UserInput9 = 'NO' AND ButtonPressed9 = 'OK') = $'''TRUE''' THEN
+                            MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                        ELSE
+                            GOTO L
+                        END
+                    ELSE
+                        MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''{Tab}{Tab}%CurrentItem2['ΕΝΤ_ΑΓ']%{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                    END
+                END
+
+                # ── 5l. FETCH PDF FROM ARCHIVE IF NOT ALREADY IN STAGING ─────
+                IF (File.IfFile.DoesNotExist File: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''') THEN
+                    IF UserInput = 3 THEN
+                        File.Move Files: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΑΠΑΛΛΑΓΗ ΦΠΑ\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 2 THEN
+                        File.Move Files: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΕΝΕΡΓΗΤΙΚΗ\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 5 THEN
+                        File.Move Files: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΕΛΕΥΘΕΡΑ\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 12 THEN
+                        File.Move Files: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΕΝΕΡΓΗΤΙΚΗ - INF\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 8 THEN
+                        File.Move Files: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΠΛΑΚΑΚΙ ΕΝΕΡΓΗΤΙΚΗ\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    END
+                END
+
+                # ── 5m. OPERATOR CONFIRMATION (CONTINUE?) ───────────────────
+                IF (CurrentItem2['ΤΕΛΩΝ'] = '4001' OR (UserInput2 <> 'AL' AND CurrentItem2['ΤΕΛΩΝ'] = '0832')) = $'''TRUE''' THEN
+                    SET ButtonPressed10 TO $'''OK'''
+                ELSE
+                    Display.InputDialog Title: $'''ΘΕΛΕΤΕ ΝΑ ΣΥΝΕΧΙΣΕΤΕ;''' Message: $'''ΘΕΛΕΤΕ ΝΑ ΣΥΝΕΧΙΣΕΤΕ;''' InputType: Display.InputType.SingleLine IsTopMost: False ButtonPressed=> ButtonPressed10
+                END
+
+                # ── 5n. SAVE SAP RECORD ───────────────────────────────────────
+                MouseAndKeyboard.SendKeys.FocusAndSendKeysByControl Control: [ELEMENT] TextToSend: $'''{Control}({S})''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 3
+
+                # ── 5o. ATTACH PDF TO SAP DOCUMENT ───────────────────────────
+                UIAutomation.PressButton Button: [ELEMENT]  # Attachment split button
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 0.7
+                UIAutomation.PressButton Button: [ELEMENT]  # Attachment dropdown arrow
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 0.3
+                UIAutomation.PressButton Button: [ELEMENT]  # Δημιουργία Προσάρτησης (Create Attachment)
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 0.3
+
+                # Navigate to SAP GUI folder in attachment dialog
+                UIAutomation.PressButton Button: [ELEMENT]  # Quick access
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 0.3
+                UIAutomation.Click.Click Element: [ELEMENT]  # SAP GUI folder (double-click)
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 3
+
+                # Type filename: "MRN ΤΥΠΟΣ" and confirm
+                MouseAndKeyboard.SendKeys.FocusAndSendKeys TextToSend: $'''%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%{Return}''' DelayBetweenKeystrokes: 10 SendTextAsHardwareKeys: False
+                ON ERROR
+                    REPEAT ACTION
+                END
+
+                WAIT (MouseAndKeyboard.WaitForMouse.WaitForMouseToBecomeDifferentThan MousePointerState: MouseAndKeyboard.MousePointerState.WaitCursor)
+                ON ERROR
+                    REPEAT ACTION
+                END
+
+                WAIT (UIAutomation.WaitForWindowContent.WindowToContainElement Element: [ELEMENT])  # Attachment confirmation
+                ON ERROR
+                    REPEAT ACTION
+                END
+
+                UIAutomation.CloseWindow.Close Window: [ELEMENT]  # Close attachment preview window
+                ON ERROR
+                    REPEAT ACTION
+                END
+                WAIT 2
+
+                UIAutomation.CloseWindow.CloseByTitleClass Title: $'''''' Class: $'''SAP_FRONTEND_SESSION'''
+
+                # ── 5p. ARCHIVE PDF TO REGIME FOLDER ─────────────────────────
+                IF ButtonPressed10 = $'''OK''' THEN
+                    IF UserInput = 3 THEN
+                        File.Move Files: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΑΠΑΛΛΑΓΗ ΦΠΑ\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 2 THEN
+                        File.Move Files: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΕΝΕΡΓΗΤΙΚΗ\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 5 THEN
+                        File.Move Files: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΕΛΕΥΘΕΡΑ\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 12 THEN
+                        File.Move Files: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΕΝΕΡΓΗΤΙΚΗ - INF''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE IF UserInput = 8 THEN
+                        File.Move Files: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf''' Destination: $'''\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\...\ΠΛΑΚΑΚΙ ΕΝΕΡΓΗΤΙΚΗ\''' IfFileExists: File.IfExists.DoNothing MovedFiles=> MovedFiles2
+                    ELSE
+                        File.Delete Files: $'''C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY\Documents\SAP\SAP GUI\%CurrentItem['MRN']% %CurrentItem['ΤΥΠΟΣ']%.pdf'''
+                    END
+                ELSE
+                    GOTO Z
+                END
+
+            END  # END inner loop (declaration lines)
+        ELSE
+            WebAutomation.CloseWebBrowser BrowserInstance: Browser
+            ON ERROR
+                REPEAT ACTION
+            END
+        END
+    END
+END  # END outer loop (new MRNs)
+
+LABEL Z
