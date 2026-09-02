@@ -5,7 +5,7 @@ End-to-end automation of the full import declaration lifecycle: data retrieval f
 
 ## Workflow
 
-<img src="workflow.png" width="600"/>
+<img src="workflow.png" width="800"/>
 
 The workflow exists in two implementations:
 
