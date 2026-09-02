@@ -14,40 +14,6 @@ The workflow exists in two implementations:
 | `IMA.robin` | Power Automate Desktop + Power Query M | PAD orchestrates UI interactions; Excel/PQ acts as the data reconciliation and XML parsing engine |
 | `IMA-IMC.py` | Python (Selenium, pywinauto, pandas, tkinter) | Single Python orchestrator; Selenium drives the browser, pywinauto drives SAP GUI, pandas handles all data logic |
 
----
-
-## Workflow Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Phase A (once per run)                                             │
-│                                                                     │
-│  A.1  ICISNET scraping ──────── declaration list → DataFrame       │
-│  A.2  SAP export (LIST_N) ───── posted declarations → Excel        │
-│  A.3  Reconciliation engine ─── compare → new MRNs only           │
-│                                                                     │
-│  ▸ Python:  Selenium (A.1) + pywinauto (A.2) + pandas (A.3)       │
-│  ▸ PAD:     Web Automation (A.1) + UI Automation (A.2) + PQ (A.3) │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │
-              Approval popup — operator reviews, edits, selects MRNs
-                             │
-┌────────────────────────────▼────────────────────────────────────────┐
-│  Phase B (per selected MRN)                                         │
-│                                                                     │
-│  B.1  Download XML from ICISNET (message type ID29)                │
-│  B.2  Parse XML → line items (customs office, HS code, duty, VAT…) │
-│  B.3  Rename PDF to target filename                                 │
-│  B.4  SAP entry loop (one iteration per declaration line)          │
-│         - Regime routing: 3=ΦΠΑ Exemption / 2=Inward Processing   │
-│                           5=Free Circulation / 12=IP-INF           │
-│         - Alloy mapping from HS code (AL / MG / MN / FE / SCRAP)  │
-│         - Authorisation numbers by regime and declaration type      │
-│  B.5  Attach PDF to SAP document (ZGOS_ZIMP1)                      │
-│  B.6  Archive PDF to regime-specific network folder                │
-│  B.7  Mark MRN as DONE in output Excel                             │
-└─────────────────────────────────────────────────────────────────────┘
-```
 
 ---
 
