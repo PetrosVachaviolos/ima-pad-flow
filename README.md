@@ -2,6 +2,11 @@
 
 End-to-end automation of the full import declaration lifecycle: data retrieval from two government systems, XML parsing, SAP posting, PDF attachment and file archiving.
 
+
+## Workflow
+
+<img src="workflow.png" width="600"/>
+
 The workflow exists in two implementations:
 
 | File | Stack | Approach |
