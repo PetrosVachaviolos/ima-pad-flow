@@ -80,14 +80,14 @@ DESKTOP       = _BASE / "Desktop"
 DOCUMENTS     = _BASE / "Documents"
 SAP_FILE_A    = DESKTOP / "LIST_N.sap"
 SAP_FILE_B    = DESKTOP / "ZELVMM_IMP_1.sap"
-GERAKARHS     = DESKTOP / "MRN_REFERENCE" / "MRN.xlsx"
+BROKER_XLSX     = DESKTOP / "MRN_REFERENCE" / "MRN.xlsx"
 DATABASE_XLSX = DESKTOP / "ΕΙΣΑΓΩΓΕΣ_database.xlsx"
 SAP_GUI_DIR   = DOCUMENTS / "SAP" / "SAP GUI"
 PDF_SAVE_PATH = DESKTOP / "Αναζήτηση _ Αποτελέσματα Αναζήτησης.pdf"
 OUTPUT_EXCEL  = DESKTOP / "python" / "FULL_RESULTS.xlsx"
 SAVE_FOLDER   = DESKTOP / "python" / "xml_temp"
 XML_PATH      = SAVE_FOLDER / "current.xml"
-ATLAS_BASE    = Path(r"\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\ΗΛΕΚΤΡΟΝΙΚΟ ΑΡΧΕΙΟ ΔΙΑΣΑΦΗΣΕΩΝ ΕΙΣΑΓΩΓΩΝ")
+ARCHIVE_BASE    = Path(r"\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\ΗΛΕΚΤΡΟΝΙΚΟ ΑΡΧΕΙΟ ΔΙΑΣΑΦΗΣΕΩΝ ΕΙΣΑΓΩΓΩΝ")
 
 KATH_DIR = {
     3:  "ΑΠΑΛΛΑΓΗ ΦΠΑ",
@@ -255,7 +255,7 @@ def phase_a_icisnet() -> pd.DataFrame:
             df.columns = [str(c).strip() for c in df.columns]
             repl = [
                 ("YOUR_LRN_PREFIX_ALT/", "YOUR_LRN_PREFIX/"), ("ELVELV", "ELV"),
-                ("YOUR_LRN_PREFIX_ALT /", "ELV800924063/25 /"),
+                ("YOUR_LRN_PREFIX_ALT /", "ELVYOUR_BROKER_ID/25 /"),
                 ("YOUR_VAT_PREFIX_WRONG", "YOUR_VAT_PREFIX_CORRECT"),
                 ("YOUR_CB_PREFIX_SHORT", "YOUR_CB_PREFIX_LONG"), ("YOUR_CB_ALT", "YOUR_CB_ALT_CORRECT"),
             ]
@@ -327,7 +327,7 @@ def phase_a_sap_export():
             app2 = Application(backend="uia").connect(title="ΔΙΑΣΑΦΗΣΗ ΕΙΣΑΓΩΓΩΝ", timeout=60)
             win2 = app2.window(title="ΔΙΑΣΑΦΗΣΗ ΕΙΣΑΓΩΓΩΝ")
             win2.wait("ready", timeout=30).set_focus(); win2.maximize()
-            send_keys("{TAB 6}" + DATE_FROM + "{TAB}" + DATE_TO + "{TAB 5}1100")
+            send_keys("{TAB 6}" + DATE_FROM + "{TAB}" + DATE_TO + "{TAB 5}YOUR_COMPANY_CODE")
             win2.child_window(title="Εκτέλεση", control_type="Button").click_input()
             time.sleep(10)
 
@@ -366,7 +366,7 @@ def phase_a_sap_export():
 
 def phase_a_queries(df_final: pd.DataFrame) -> pd.DataFrame:
     print("  Building queries...")
-    df_ger = pd.read_excel(GERAKARHS, sheet_name=0)
+    df_ger = pd.read_excel(BROKER_XLSX, sheet_name=0)
     df_db  = pd.read_excel(DATABASE_XLSX, sheet_name=0)
 
     df_ger["MRN"]       = df_ger["MRN"].astype(str)
@@ -1272,7 +1272,7 @@ def sap_entry(row, prot: str, sap_running: bool = False):
 
         time.sleep(1)
 
-        send_keys("1100{ENTER}", pause=0.05)
+        send_keys("YOUR_COMPANY_CODE{ENTER}", pause=0.05)
         time.sleep(1)
         print("Έστειλε την εταιρεία")
     for _ in range(10):
@@ -1317,9 +1317,9 @@ def sap_entry(row, prot: str, sap_running: bool = False):
                 pyautogui.hotkey("enter")
 
                 time.sleep(1)
-                # 1100 + ENTER
-                print("Sending company code 1100...")
-                send_keys("1100{ENTER}", pause=0.05)
+                # company code + ENTER
+                print("Sending company code...")
+                send_keys("YOUR_COMPANY_CODE{ENTER}", pause=0.05)
                 time.sleep(1)
                 print("Done!")
             except: pass
@@ -1383,17 +1383,17 @@ def sap_entry(row, prot: str, sap_running: bool = False):
         send_keys(f"{tl}{{TAB}}{tl}{{TAB}}{ty}{{TAB}}{{TAB}}"
                   f"{mn}{{TAB}}{mn}{{TAB}}{{TAB}}"
                   f"{im}{{TAB}}{im}{{TAB}}{{TAB}}"
-                  f"{dk}{{TAB}}{{TAB}}1100{{TAB}}{aa}{{TAB}}{xw}{{TAB}}", pause=0.05)
+                  f"{dk}{{TAB}}{{TAB}}YOUR_COMPANY_CODE{{TAB}}{aa}{{TAB}}{xw}{{TAB}}", pause=0.05)
     else:
         send_keys(f"{tl}{{TAB}}{{TAB}}{ty}{{TAB}}{{TAB}}"
                   f"{mn}{{TAB}}{{TAB}}{{TAB}}"
                   f"{im}{{TAB}}{{TAB}}{{TAB}}"
-                  f"{dk}{{TAB}}{{TAB}}1100{{TAB}}{aa}{{TAB}}{xw}{{TAB}}", pause=0.05)
+                  f"{dk}{{TAB}}{{TAB}}YOUR_COMPANY_CODE{{TAB}}{aa}{{TAB}}{xw}{{TAB}}", pause=0.05)
 
     send_keys(f"{kath}{{TAB}}{tk_}{{TAB}}", pause=0.05)
 
-    is_swan = (kath == 3 and tk_ == "6121" and pr == "SUPPLIER_NAME_PASSIVE" and dk == "76012080")
-    if is_swan:
+    is_special = (kath == 3 and tk_ == "6121" and pr == "SUPPLIER_NAME_PASSIVE" and dk == "76012080")
+    if is_special:
         send_keys(f"{il}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}"
                   f"AUTH_NUMBER_PASSIVE{{TAB}}"
                   f"{vr}{{TAB}}KG{{TAB}}{sa}{{TAB}}{ns}{{TAB}}"
@@ -1691,7 +1691,7 @@ def process_mrn(row: dict, driver) -> bool:
     kath        = int(df_result.iloc[0]["ΚΑΘ"])
     dest_subdir = KATH_DIR.get(kath)
     if dest_subdir and dst_pdf.exists():
-        dest = ATLAS_BASE / dest_subdir / f"{pdf}.pdf"
+        dest = ARCHIVE_BASE / dest_subdir / f"{pdf}.pdf"
         try:
             shutil.move(str(dst_pdf), str(dest))
             print(f"  PDF moved -> {dest_subdir}")
