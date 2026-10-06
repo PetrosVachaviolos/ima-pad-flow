@@ -7,12 +7,13 @@ End-to-end automation of the full import declaration lifecycle: data retrieval f
 
 <img src="workflow.png" width="800"/>
 
-The workflow exists in two implementations:
+The workflow exists in three implementations — all kept in the repository so the progression is visible:
 
 | File | Stack | Approach |
 |------|-------|---------|
-| `IMA.robin` | Power Automate Desktop + Power Query M | PAD orchestrates UI interactions; Excel/PQ acts as the data reconciliation and XML parsing engine |
-| `IMA-IMC.py` | Python (Selenium, SAP GUI Scripting, pandas, tkinter) | Single Python orchestrator; Selenium drives the browser, the SAP GUI Scripting API drives SAP, pandas handles all data logic |
+| [`IMA.robin`](IMA.robin) | Power Automate Desktop + Power Query M | PAD orchestrates UI interactions; Excel/PQ acts as the data reconciliation and XML parsing engine |
+| [`legacy/IMA-IMC_pywinauto.py`](legacy/IMA-IMC_pywinauto.py) | Python (Selenium, pywinauto, pandas, tkinter) | First Python port; SAP driven through window automation and keystrokes ([diagram](legacy/workflow_pywinauto.png)) |
+| [`IMA-IMC.py`](IMA-IMC.py) — **current** | Python (Selenium, SAP GUI Scripting, pandas, tkinter) | Single Python orchestrator; Selenium drives the browser, the SAP GUI Scripting API drives SAP, pandas handles all data logic |
 
 SAP is driven through the **SAP GUI Scripting API** — every field is written by its element ID, so the run does not depend on window focus, tab order or timing.
 
@@ -33,7 +34,7 @@ The same process has been automated three times, each step removing a class of f
 | **Credentials** | typed into the flow | in the source | Windows Credential Manager |
 | **Troubleshooting** | none | console output | file log with per-step timing + screenshot on error |
 
-The previous Python version (pywinauto) is available in the commit history.
+All three are in the repository: [`IMA.robin`](IMA.robin), [`legacy/IMA-IMC_pywinauto.py`](legacy/IMA-IMC_pywinauto.py) and [`IMA-IMC.py`](IMA-IMC.py).
 
 ---
 
