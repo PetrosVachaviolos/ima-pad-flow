@@ -1,24 +1,24 @@
 # ==============================================================================
-# main.py — Orchestrator (full pipeline)
+# main.py — Orchestrator (ΠΛΗΡΗΣ ΡΟΕΣ)
 # ==============================================================================
 #
-# PHASE A (once per run):
+# ΦΑΣΗ Α (μια φορά):
 #   1. Selenium → ICISnet scraping → df_final
 #   2. Pywinauto → SAP export → ΕΙΣΑΓΩΓΕΣ_database.xlsx
 #   3. Queries → FULL_RESULTS.xlsx (opened / done / undone)
 #
-# PAUSE — Editable approval popup:
-#   Shows: MRN, PROT, PDF, PDF.1, STATUS
-#   Checkbox per row | Double-click → inline edit | OK → start Phase B
+# PAUSE — Popup editable πίνακας:
+#   Βλέπεις: MRN, PROT, PDF, PDF.1, ΚΑΤΑΣΤΑΣΗ
+#   Checkbox ανά γραμμή | Double-click → inline edit | OK → εκκίνηση
 #
-# PHASE B (for each selected MRN):
-#   4. Selenium → ICISnet → ID29 → download XML → browser quit
-#   5. Parse XML → df_result + filters
-#   6. PDF rename (pdf1 → pdf)
-#   7. SAP entry loop (login only on first item per MRN)
-#   8. sap_attach + wait for confirmation
-#   9. SAP closes → PDF move → archive folder
-#  10. Status → DONE in FULL_RESULTS.xlsx
+# ΦΑΣΗ Β σε δύο μέρη:
+# Β.1 (μόνο ICISNet, SAP κλειστό) για ΟΛΑ τα επιλεγμένα MRN σερί:
+#   XML -> xml\<MRN>.xml (αν υπάρχει, δεν ξανακατεβαίνει) -> έλεγχος MRN ->
+#   parse + φίλτρα -> κράματα -> ΟΛΑ τα popups (ΚΡΑΜΑ/ΠΡΟΤΙΜΗΣΗ/ΕΝΤΟΛΗ ΑΓΟΡΑΣ).
+#   Σφάλμα σε ένα MRN δεν σταματάει τα υπόλοιπα. Browser κλείνει.
+# Β.2 (μόνο SAP, ΕΝΑ login, κανένα popup) για κάθε MRN:
+#   PDF rename -> ανά Α/Α γέμισμα/Save/attach -> PDF move -> Status DONE.
+#   Σφάλμα -> σταματάει το batch (νεκρό session). SAP κλείνει.
 #
 # ==============================================================================
 
@@ -32,6 +32,7 @@ import base64
 import warnings
 import subprocess
 import traceback
+import logging
 import ctypes
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -58,7 +59,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 from pywinauto import Application
 from pywinauto.keyboard import send_keys
 
-# Encoding for Power Automate compatibility
+import win32com.client
+import win32event
+
+# Encoding για Power Automate
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", line_buffering=True)
 
@@ -70,24 +74,38 @@ os.environ["WDM_SSL_VERIFY"] = "0"
 ssl._create_default_https_context = ssl._create_unverified_context
 warnings.filterwarnings("ignore")
 
-ICISNET_USER  = "YOUR_ICISNET_USERNAME"
-ICISNET_PASS  = "YOUR_ICISNET_PASSWORD"
-SAP_USER      = "YOUR_SAP_USERNAME"
-SAP_PASS      = "YOUR_SAP_PASSWORD"
+import keyring
 
-_BASE         = Path(r"C:\Users\YOUR_USERNAME\OneDrive - YOUR_COMPANY")
+ICISNET_USER  = "YOUR_ICISNET_USER"
+ICISNET_PASS  = keyring.get_password("ICISNET", ICISNET_USER)
+SAP_USER      = "YOUR_SAP_USER"
+SAP_PASS      = keyring.get_password("YOUR_SAP_KEYRING", SAP_USER)
+
+# Κοινό mutex σε ΟΛΑ τα scripts που αγγίζουν SAP — βλ. ΤΙΜΟΛΟΓΙΑ.py.
+SAP_MUTEX_NAME = "Global\\SAP_Automation_Lock"
+COMPANY_CODE = "YOUR_COMPANY_CODE"
+
+for _name, _user, _pass in [("ICISNET", ICISNET_USER, ICISNET_PASS), ("YOUR_SAP_KEYRING", SAP_USER, SAP_PASS)]:
+    if _pass is None:
+        raise RuntimeError(
+            f"Δεν βρέθηκε password στο Credential Manager για '{_name}'. Τρέξε μία φορά:\n"
+            f"    python -m keyring set {_name} {_user}\n"
+            "και πληκτρολόγησε το password όταν σου ζητηθεί."
+        )
+
+_BASE         = Path(r"C:\Users\YOUR_USERNAME")
 DESKTOP       = _BASE / "Desktop"
 DOCUMENTS     = _BASE / "Documents"
 SAP_FILE_A    = DESKTOP / "LIST_N.sap"
 SAP_FILE_B    = DESKTOP / "ZELVMM_IMP_1.sap"
-GERAKARHS     = DESKTOP / "MRN_REFERENCE" / "MRN.xlsx"
+BROKER_XLSX     = DESKTOP / "BROKER" / "MRN.xlsx"
 DATABASE_XLSX = DESKTOP / "ΕΙΣΑΓΩΓΕΣ_database.xlsx"
 SAP_GUI_DIR   = DOCUMENTS / "SAP" / "SAP GUI"
 PDF_SAVE_PATH = DESKTOP / "Αναζήτηση _ Αποτελέσματα Αναζήτησης.pdf"
-OUTPUT_EXCEL  = DESKTOP / "python" / "FULL_RESULTS.xlsx"
-SAVE_FOLDER   = DESKTOP / "python" / "xml_temp"
-XML_PATH      = SAVE_FOLDER / "current.xml"
-ATLAS_BASE    = Path(r"\\YOUR_SERVER\YOUR_SHARE\ΤΕΛΩΝΕΙΑ\ΗΛΕΚΤΡΟΝΙΚΟ ΑΡΧΕΙΟ ΔΙΑΣΑΦΗΣΕΩΝ ΕΙΣΑΓΩΓΩΝ")
+OUTPUT_EXCEL  = Path(__file__).resolve().parent / "FULL_RESULTS.xlsx"
+SAVE_FOLDER   = Path(__file__).resolve().parent / "xml_temp"   # λήψη Chrome (αδειάζει πριν από κάθε λήψη)
+XML_DIR       = Path(__file__).resolve().parent / "xml"        # ένα XML ανά MRN — αν υπάρχει, δεν ξανακατεβαίνει
+ARCHIVE_BASE    = Path(r"\\YOUR_SERVER\YOUR_SHARE\IMPORT_DECLARATIONS")
 
 KATH_DIR = {
     3:  "ΑΠΑΛΛΑΓΗ ΦΠΑ",
@@ -96,28 +114,106 @@ KATH_DIR = {
     12: "ΕΝΕΡΓΗΤΙΚΗ - INF",
 }
 
+
+def compute_kath(x16: str, tk_: str) -> int:
+    if x16 == "X16":             return 3
+    elif tk_ == "5111":          return 12
+    elif tk_.startswith("5"):    return 2
+    else:                        return 5
+
 _now      = datetime.now()
 DATE_TO   = _now.strftime("%d.%m.%Y")
-DATE_FROM = (_now.replace(day=1) - relativedelta(months=5)).strftime("01.%m.%Y")
+DATE_FROM = (_now.replace(day=1) - relativedelta(months=1)).strftime("01.%m.%Y")
 
-# ⚠️  Update this each time the processing period changes
+# ⚠️  Άλλαξε αυτό κάθε φορά που αλλάζει η περίοδο 
 LIMIT_DATE = pd.Timestamp(2025, 8, 1).date()
 
 SHOW_COLS     = ["MRN", "PROT", "PDF", "PDF.1", "ΚΑΤΑΣΤΑΣΗ"]
 EDIT_COLS     = {"PROT", "PDF", "PDF.1"}
 ALLOWED_DASMOS = ("76", "72", "81", "2804690", "2710112")
 
+# ── Logging (ίδιο pattern με script ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ) ────────────────────
+_SCRIPT_NAME = Path(__file__).stem
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_FILE = _LOG_DIR / f"{_SCRIPT_NAME}_{datetime.now():%Y%m%d_%H%M%S}.log"
+logging.basicConfig(
+    level=logging.WARNING,  # root: κόβει το θορυβώδες DEBUG τρίτων (selenium/urllib3 κλπ)
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.FileHandler(_LOG_FILE, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(_SCRIPT_NAME)
+log.setLevel(logging.DEBUG)  # μόνο το δικό μας logger σε DEBUG
+log.info(f"Log file: {_LOG_FILE}")
+
+
+class _ErrorFlag(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.seen = False
+
+    def emit(self, record):
+        self.seen = True
+
+
+_ERROR_FLAG = _ErrorFlag()
+logging.getLogger().addHandler(_ERROR_FLAG)
+_SAVED = {"n": 0}
+
+
+def _finish_log() -> None:
+    """Το log μένει μόνο αν έγινε σφάλμα ή σώθηκε έστω μία καταχώρηση — αλλιώς σβήνεται."""
+    if _ERROR_FLAG.seen or _SAVED["n"]:
+        return
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        if isinstance(h, logging.FileHandler):
+            h.close()
+            root.removeHandler(h)
+    _LOG_FILE.unlink(missing_ok=True)
+
+
+def save_screenshot(tag: str) -> Path:
+    """Screenshot για οπτικό/audit έλεγχο — καλείται μετά από κάθε SAP entry
+    (επιτυχία ή σφάλμα). Φέρνει ΠΡΩΤΑ το SAP window μπροστά (foreground),
+    ώστε το screenshot να δείχνει ΠΑΝΤΑ το SAP και όχι ό,τι άλλο τύχει να
+    είναι ενεργό στην οθόνη τη δεδομένη στιγμή."""
+    path = _LOG_DIR / f"{_SCRIPT_NAME}_{tag}_{datetime.now():%Y%m%d_%H%M%S}.png"
+    try:
+        Application(backend="uia").connect(
+            class_name="SAP_FRONTEND_SESSION", timeout=5
+        ).window(class_name="SAP_FRONTEND_SESSION").set_focus()
+        time.sleep(0.3)
+    except Exception as e:
+        log.warning(f"Δεν βρέθηκε/έγινε focus το SAP window για screenshot: {e}")
+    try:
+        pyautogui.screenshot(str(path))
+        log.info(f"Screenshot αποθηκεύτηκε: {path}")
+    except Exception as e:
+        log.exception(f"Απέτυχε το screenshot: {e}")
+    return path
+
 # ==============================================================================
 # HELPERS
 # ==============================================================================
 
 def make_chrome(download_folder: Path = None):
-    """Build Chrome driver. If download_folder is provided → auto-download mode."""
+    """Φτιάχνει Chrome driver. Αν δοθεί download_folder → auto-download mode."""
     opts = Options()
     opts.add_argument("--ignore-certificate-errors")
     opts.add_argument("--start-maximized")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    # Απενεργοποιεί άσχετες προσπάθειες σύνδεσης σε Google υπηρεσίες (GCM,
+    # component updater κλπ) που μπλοκάρονται από το εταιρικό δίκτυο και
+    # απλά καθυστερούν το άνοιγμα - δεν έχουν καμία σχέση με το ICISnet.
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-component-update")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--disable-client-side-phishing-detection")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
     if download_folder:
         opts.add_experimental_option("prefs", {
             "download.default_directory": str(download_folder),
@@ -134,6 +230,136 @@ def close_sap():
     for proc in ["saplogon.exe", "saplgpad.exe", "sapgui.exe", "nwbc.exe"]:
         subprocess.call(["taskkill", "/F", "/T", "/IM", proc],
                         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+
+def sap_login(transaction_code: str):
+    """
+    Login μέσω SAP GUI Scripting (OpenConnection, χωρίς pywinauto) + πλοήγηση
+    στο δοσμένο transaction μέσω του πεδίου εντολών (okcd). Επιστρέφει session.
+    (Ίδιο με το script ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ — validated live.)
+    """
+    close_sap(); time.sleep(2)
+    subprocess.Popen('start "" saplogon.exe', shell=True); time.sleep(3)
+
+    sap_gui_auto = None
+    for _ in range(30):
+        try:
+            sap_gui_auto = win32com.client.GetObject("SAPGUI")
+            break
+        except Exception:
+            time.sleep(1)
+    if sap_gui_auto is None:
+        raise RuntimeError("SAPGUI scripting engine δεν βρέθηκε (timeout).")
+
+    application = sap_gui_auto.GetScriptingEngine
+    connection  = application.OpenConnection("YOUR_SAP_CONNECTION", True)
+    session     = connection.Children(0)
+    time.sleep(1)
+
+    session.findById("wnd[0]/usr/txtRSYST-MANDT").text = "YOUR_CLIENT"
+    session.findById("wnd[0]/usr/txtRSYST-BNAME").text = SAP_USER
+    session.findById("wnd[0]/usr/pwdRSYST-BCODE").text = SAP_PASS
+    session.findById("wnd[0]/usr/txtRSYST-LANGU").text = "EL"
+    session.findById("wnd[0]").sendVKey(0)
+    time.sleep(3)
+
+    sap_navigate(session, transaction_code)
+    return session
+
+
+def sap_ima_login():
+    """
+    Άνοιγμα SAP Logon + username/password login. ΔΕΝ μπαίνει καθόλου στο
+    transaction — αυτό το κάνει το sap_ima_reenter_transaction(), που
+    καλείται ξεχωριστά ΚΑΘΕ φορά ακριβώς πριν από μια καταχώρηση (ώστε το
+    XML να είναι ήδη έτοιμο ΠΡΙΝ ξεκινήσει η πλοήγηση SAP, όχι μετά).
+    Καλείται ΜΙΑ φορά για όλο το batch. Επιστρέφει session.
+    """
+    close_sap(); time.sleep(2)
+    subprocess.Popen('start "" saplogon.exe', shell=True)
+    time.sleep(3)
+
+    sap_gui_auto = None
+    for _ in range(30):
+        try:
+            sap_gui_auto = win32com.client.GetObject("SAPGUI")
+            break
+        except Exception:
+            time.sleep(1)
+    if sap_gui_auto is None:
+        raise RuntimeError("SAPGUI scripting engine δεν βρέθηκε (timeout).")
+
+    application = sap_gui_auto.GetScriptingEngine
+    connection = application.OpenConnection("YOUR_SAP_CONNECTION", True)
+    session = connection.Children(0)
+    time.sleep(1)
+
+    session.findById("wnd[0]/usr/txtRSYST-MANDT").text = "YOUR_CLIENT"
+    session.findById("wnd[0]/usr/txtRSYST-BNAME").text = SAP_USER
+    session.findById("wnd[0]/usr/pwdRSYST-BCODE").text = SAP_PASS
+    session.findById("wnd[0]/usr/txtRSYST-LANGU").text = "EL"
+    session.findById("wnd[0]").sendVKey(0)
+    time.sleep(3)
+
+    return session
+
+
+def sap_ima_reenter_transaction(session):
+    """
+    ZELVMM_IMP_1 (okcd) + Επιλογή Πεδίου (ΕΤΑΙΡΙΑ=COMPANY_CODE) + Εκτέλεση +
+    Εμφάνιση→Αλλαγή. ΣΤΑΜΑΤΑΕΙ στην οθόνη "...Επισκόπηση/Αλλαγή" — ΔΕΝ
+    πατάει "Νέες Καταχωρίσεις" ακόμα. Καλείται ΚΑΘΕ φορά ακριβώς πριν από
+    μια καταχώρηση (και την πρώτη, και τις επόμενες μετά το διπλό F3) —
+    ΠΟΤΕ πριν είναι έτοιμο το XML του MRN, πάντα μετά (επιβεβαιώθηκε ότι
+    το "Επιλογή Πεδίου" εμφανίζεται ΚΑΘΕ φορά, όχι μόνο την πρώτη).
+    """
+    session.findById("wnd[0]/tbar[0]/okcd").text = "ZELVMM_IMP_1"
+    session.findById("wnd[0]/tbar[0]/btn[0]").press()
+    time.sleep(2)
+
+    for idx in [0, 1, 2, 4, 6]:
+        session.findById(
+            f"wnd[1]/usr/sub:SAPLSVIX:0210/chkMARK_CHECKBOX[{idx},0]"
+        ).Selected = True
+    session.findById("wnd[1]/tbar[0]/btn[0]").press()
+    time.sleep(1)
+
+    session.findById("wnd[1]/usr/sub:SAPLSVIX:0100/ctxtD0100_FIELD_TAB-LOWER_LIMIT[6,37]").text = COMPANY_CODE
+    session.findById("wnd[1]/usr/sub:SAPLSVIX:0100/ctxtD0100_FIELD_TAB-UPPER_LIMIT[7,37]").text = COMPANY_CODE
+
+    session.findById("wnd[1]/tbar[0]/btn[0]").press()
+    time.sleep(3)
+
+    session.findById("wnd[0]").maximize()
+    time.sleep(2)
+    session.findById("wnd[0]/tbar[1]/btn[25]").press()
+    time.sleep(2)
+
+
+def sap_ima_open_new_entry(session):
+    """Πατάει "Νέες Καταχωρίσεις" (btn[5]) + maximize. Καλείται ΓΙΑ ΚΑΘΕ
+    καταχώρηση, μετά το sap_ima_reenter_transaction()."""
+    session.findById("wnd[0]/tbar[1]/btn[5]").press()
+    time.sleep(2)
+    session.findById("wnd[0]").maximize()
+    time.sleep(1)
+
+
+def sap_ima_back_to_overview(session):
+    """Διπλό F3 (Πίσω) — γυρνάει ΠΙΣΩ ΜΕΧΡΙ ΤΟ ΣΗΜΕΙΟ ΠΟΥ ΘΑ ΞΑΝΑΓΡΑΨΟΥΜΕ
+    ZELVMM_IMP_1 (επιβεβαιώθηκε από τον χρήστη) — ίδιο pattern "διπλό F3"
+    με το attach_pdf_gos() του ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ NEW. Μετά από αυτό πρέπει
+    να καλείται sap_ima_reenter_transaction(), όχι απευθείας
+    sap_ima_open_new_entry()."""
+    session.findById("wnd[0]/tbar[0]/btn[3]").press(); time.sleep(1)
+    session.findById("wnd[0]/tbar[0]/btn[3]").press(); time.sleep(1)
+
+
+def sap_navigate(session, transaction_code: str):
+    """Πλοήγηση σε transaction μέσω του πεδίου εντολών (okcd)."""
+    session.findById("wnd[0]/tbar[0]/okcd").text = transaction_code
+    session.findById("wnd[0]/tbar[0]/btn[0]").press()
+    time.sleep(2)
 
 
 def setup_keyboard():
@@ -155,14 +381,47 @@ def safe_select(wait, element_id, text):
 
 
 def popup_input(title: str, prompt: str, default: str = "") -> str:
-    from tkinter import simpledialog
-    root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
-    result = simpledialog.askstring(title, prompt, initialvalue=default, parent=root)
-    root.destroy()
-    return result.strip() if result else ""
+    """Custom (όχι simpledialog) ώστε να μπορούμε να το φέρουμε πάντα μπροστά
+    με topmost/lift/focus_force πάνω στο ΙΔΙΟ ορατό window — το simpledialog
+    πάνω σε withdrawn root δεν ερχόταν πάντα μπροστά από το SAP."""
+    root = tk.Tk()
+    root.title(title)
+    root.resizable(False, False)
+    root.configure(bg="#F5F4F0")
+    w, h = 420, 160
+    sw = root.winfo_screenwidth(); sh = root.winfo_screenheight()
+    root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+    root.attributes("-topmost", True)
+
+    result = {"value": None}
+
+    tk.Label(root, text=prompt,
+        bg="#F5F4F0", fg="#1A1A1A", font=("Consolas", 10),
+        wraplength=380, justify="center"
+    ).pack(pady=(20, 10))
+
+    entry = tk.Entry(root, font=("Consolas", 11), justify="center")
+    entry.insert(0, default)
+    entry.pack(pady=(0, 15), ipady=3, padx=40, fill="x")
+
+    def submit(event=None):
+        result["value"] = entry.get()
+        root.destroy()
+
+    tk.Button(root, text="OK", font=("Consolas", 10, "bold"),
+        bg="#1A1A1A", fg="#FFFFFF", relief="flat", padx=20, pady=6,
+        cursor="hand2", command=submit
+    ).pack()
+
+    entry.bind("<Return>", submit)
+    root.lift(); root.focus_force()
+    entry.focus_set()
+    root.mainloop()
+
+    return result["value"].strip() if result["value"] else ""
 
 def show_info(msg: str):
-    """Show informational banner with OK button."""
+    """Εμφανίζει ενημερωτικό banner με OK."""
     root = tk.Tk()
     root.title("Ενημέρωση")
     root.resizable(False, False)
@@ -186,12 +445,12 @@ def show_info(msg: str):
     root.mainloop()
 
 # ==============================================================================
-# PHASE A.1 — ICISnet scraping
+# ΦΑΣΗ Α.1 — ICISnet scraping
 # ==============================================================================
 
 def phase_a_icisnet() -> pd.DataFrame:
     for attempt in range(1, 4):
-        print(f"  ICISnet — attempt {attempt}/3...")
+        print(f"  ICISnet — απόπειρα {attempt}/3...")
         driver = None
         try:
             driver = make_chrome()
@@ -214,6 +473,7 @@ def phase_a_icisnet() -> pd.DataFrame:
                 df_el, DATE_FROM.replace(".", "-"))
             Select(driver.find_element(By.ID, "contentForm:search_scope")).select_by_value("Trader")
 
+            t_search = perf_counter()
             for sa in range(1, 11):
                 try:
                     driver.find_element(By.XPATH, "//input[@value='Αναζήτηση']").click()
@@ -223,7 +483,9 @@ def phase_a_icisnet() -> pd.DataFrame:
                 except:
                     if sa == 10: raise
                     time.sleep(1)
+            print(f"    [χρόνος] Αναζήτηση -> αποτελέσματα έτοιμα: {fmt_duration(perf_counter() - t_search)}")
 
+            t_popup = perf_counter()
             driver.execute_script(
                 "jsfcljs(document.getElementById('contentForm'),{"
                 "'contentForm:printResultsReport':'contentForm:printResultsReport',"
@@ -233,11 +495,13 @@ def phase_a_icisnet() -> pd.DataFrame:
             driver.switch_to.window(driver.window_handles[-1])
             wait.until(EC.presence_of_element_located(
                 (By.XPATH, "//*[contains(text(),'Αποτελέσματα Αναζήτησης')]")))
+            print(f"    [χρόνος] Άνοιγμα popup 'Αποτελέσματα Αναζήτησης': {fmt_duration(perf_counter() - t_popup)}")
 
+            t_pdf = perf_counter()
             try:
                 pdf_data = driver.execute_cdp_cmd("Page.printToPDF", {"printBackground": True})
                 PDF_SAVE_PATH.write_bytes(base64.b64decode(pdf_data["data"]))
-                print("    PDF saved")
+                print(f"    PDF saved  |  [χρόνος] Page.printToPDF: {fmt_duration(perf_counter() - t_pdf)}")
             except Exception as e:
                 print(f"    PDF save failed: {e}")
 
@@ -245,19 +509,19 @@ def phase_a_icisnet() -> pd.DataFrame:
                 df_raw = pd.read_html(StringIO(driver.page_source))[0]
             except ValueError:
                 driver.quit()
-                print("    ICISnet: no import declarations found")
+                print("    ICISnet: δεν βρέθηκαν εισαγωγές")
                 return pd.DataFrame(columns=["MRN","ΤΥΠΟΣ","ΚΑΤΑΣΤΑΣΗ","LRN","ΗΜ_ΥΠΟΒ","ΗΜ_ΕΝΗΜ","PDF"])
 
             driver.quit(); driver = None
 
-            # Clean and filter results
+            # Καθαρισμός & φιλτράρισμα
             df = df_raw.copy()
             df.columns = [str(c).strip() for c in df.columns]
             repl = [
-                ("YOUR_LRN_PREFIX_ALT/", "YOUR_LRN_PREFIX/"), ("ELVELV", "ELV"),
-                ("YOUR_LRN_PREFIX_ALT /", "ELV800924063/25 /"),
-                ("YOUR_VAT_PREFIX_WRONG", "YOUR_VAT_PREFIX_CORRECT"),
-                ("YOUR_CB_PREFIX_SHORT", "YOUR_CB_PREFIX_LONG"), ("YOUR_CB_ALT", "YOUR_CB_ALT_CORRECT"),
+                ("YOUR_BROKER_ID/25/", "ELVYOUR_BROKER_ID/25/"), ("ELVELV", "ELV"),
+                ("YOUR_BROKER_ID/25 /", "ELVYOUR_BROKER_ID/25 /"),
+                ("YOUR_BROKER_ID2/26/131ELB", "YOUR_BROKER_ID2/26/131ELV"),
+                ("CBRM", "CBELVRM"), ("CB78-2023", "ELVCB78-2023"),
             ]
             df["LRN"] = df["LRN"].astype(str)
             for old, new in repl:
@@ -267,11 +531,11 @@ def phase_a_icisnet() -> pd.DataFrame:
                 df["Ημ/νία Υποβολής"], dayfirst=True, errors="coerce").dt.date
             df["Ημ/νία Ενημέρωσης Κατάστασης"] = pd.to_datetime(
                 df["Ημ/νία Ενημέρωσης Κατάστασης"], dayfirst=True, errors="coerce").dt.date
-            df = df[~df["LRN"].str.contains("EXCLUDED_LRN_PREFIX", na=False)]
+            df = df[~df["LRN"].str.contains("XALELV", na=False)]
             df = df[
                 df["LRN"].str.contains(r"ELV|ΕLV", na=False) |
-                df["LRN"].str.contains("YOUR_SPECIFIC_LRN", na=False) |
-                df["MRN"].isin(["EXAMPLE_MRN_1","EXAMPLE_MRN_2"])
+                df["LRN"].str.contains("YOUR_SPECIAL_LRN", na=False) |
+                df["MRN"].isin(["YOUR_MRN_1","YOUR_MRN_2"])
             ]
             df = df[
                 (df["Ημ/νία Υποβολής"] >= LIMIT_DATE) &
@@ -283,7 +547,7 @@ def phase_a_icisnet() -> pd.DataFrame:
                 df["Κατάσταση_Temp"].str.startswith("ID29", na=False) |
                 (df["Κατάσταση"] == "Τακτοποιημένο") |
                 df["Κατάσταση"].str.contains("Αποδεκτή", na=False) |
-                (df["MRN"] == "EXAMPLE_MRN_3")
+                (df["MRN"] == "YOUR_MRN_3")
             )
             df = df[cond]
             df["Κατάσταση"] = df["Κατάσταση_Temp"]
@@ -293,80 +557,67 @@ def phase_a_icisnet() -> pd.DataFrame:
                 "Ημ/νία Υποβολής":"ΗΜ_ΥΠΟΒ","Ημ/νία Ενημέρωσης Κατάστασης":"ΗΜ_ΕΝΗΜ"})
             df_final = df[["MRN","ΤΥΠΟΣ","ΚΑΤΑΣΤΑΣΗ","LRN","ΗΜ_ΥΠΟΒ","ΗΜ_ΕΝΗΜ","PDF"]]\
                 .sort_values(["ΗΜ_ΥΠΟΒ","MRN"], ascending=[False,True]).reset_index(drop=True)
-            print(f"    ICISnet OK — {len(df_final)} records")
+            print(f"    ICISnet OK — {len(df_final)} εγγραφές")
             return df_final
 
         except Exception as e:
             if driver:
                 try: driver.quit()
                 except: pass
-            print(f"    Failed: {e}")
+            print(f"    Απέτυχε: {e}")
             time.sleep(3)
 
-    raise RuntimeError("ICISnet scraping failed after 3 attempts.")
+    raise RuntimeError("ICISnet scraping απέτυχε μετά από 3 απόπειρες.")
 
 
 # ==============================================================================
-# PHASE A.2 — SAP export
+# ΦΑΣΗ Α.2 — SAP export
 # ==============================================================================
 
 def phase_a_sap_export():
+    """
+    SAP export μέσω SAP GUI Scripting — login και export χωρίς pywinauto.
+    Ίδιο transaction/φίλτρα/export-μενού με το phase_a_sap_export του
+    script ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ (ήδη validated live).
+    """
     for attempt in range(1, 4):
-        print(f"  SAP Export — attempt {attempt}/3...")
+        print(f"  SAP Export — απόπειρα {attempt}/3...")
         try:
-            close_sap(); time.sleep(3)
-            subprocess.Popen(f'start "" "{SAP_FILE_A}"', shell=True)
+            session = sap_login("ZELVMM_IMP_1_LIST_N")
 
-            app = Application(backend="uia").connect(title="LIST_N", timeout=60)
-            win = app.window(title="LIST_N")
-            win.child_window(auto_id="1004", control_type="Edit")\
-               .wait("exists enabled visible", timeout=30).set_text(SAP_USER)
-            win.child_window(auto_id="1005", control_type="Edit").set_text(SAP_PASS)
-            win.child_window(title="Εισ.σε Σύστ.", control_type="Button").click_input()
-
-            app2 = Application(backend="uia").connect(title="ΔΙΑΣΑΦΗΣΗ ΕΙΣΑΓΩΓΩΝ", timeout=60)
-            win2 = app2.window(title="ΔΙΑΣΑΦΗΣΗ ΕΙΣΑΓΩΓΩΝ")
-            win2.wait("ready", timeout=30).set_focus(); win2.maximize()
-            send_keys("{TAB 6}" + DATE_FROM + "{TAB}" + DATE_TO + "{TAB 5}1100")
-            win2.child_window(title="Εκτέλεση", control_type="Button").click_input()
+            session.findById("wnd[0]/usr/ctxtS_ZDATE-LOW").text = DATE_FROM
+            session.findById("wnd[0]/usr/ctxtS_ZDATE-HIGH").text = DATE_TO
+            session.findById("wnd[0]/usr/ctxtS_BUKRS-LOW").text = COMPANY_CODE
+            session.findById("wnd[0]/tbar[1]/btn[8]").press()   # Εκτέλεση
             time.sleep(10)
 
-            win2.click_input(coords=(51, 21))
-            send_keys("{DOWN 3}{RIGHT}{DOWN}{ENTER}"); time.sleep(2)
-            send_keys("{ENTER}"); time.sleep(3)
-
-            app_s = Application(backend="win32").connect(title="Save As", timeout=15)
-            dlg = app_s.window(title="Save As"); dlg.set_focus()
-            try:
-                dlg.child_window(class_name="ToolbarWindow32", found_index=1)\
-                   .button("Desktop").click_input()
-            except: pass
-            dlg.child_window(class_name="Edit").set_edit_text("ΕΙΣΑΓΩΓΕΣ_database")
-            dlg.child_window(title="&Save", class_name="Button").click_input()
-            try:
-                c = Application(backend="win32").connect(title="Confirm Save As", timeout=3)
-                d = c.window(title="Confirm Save As")
-                if d.exists(): d.child_window(title="&Yes", class_name="Button").click_input()
-            except: pass
-
+            # ── Export μέσω μενού Λίστα → Εξαγωγή → Υπολογιστικό φύλλο ──────
+            session.findById("wnd[0]").maximize()
+            session.findById("wnd[0]/mbar/menu[0]/menu[3]/menu[1]").select()
+            session.findById("wnd[1]/tbar[0]/btn[0]").press()
+            session.findById("wnd[1]/usr/ctxtDY_PATH").text = str(DESKTOP)
+            session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = "ΕΙΣΑΓΩΓΕΣ_database.xlsx"
+            session.findById("wnd[1]/usr/ctxtDY_FILENAME").caretPosition = 5
+            session.findById("wnd[1]/tbar[0]/btn[11]").press()
             time.sleep(5)
+
             subprocess.call(["taskkill","/F","/IM","excel.exe"],
                             stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             time.sleep(2); close_sap()
             print("    SAP Export OK"); return
 
         except Exception as e:
-            print(f"    Failed: {e}"); time.sleep(5)
+            print(f"    Απέτυχε: {e}"); time.sleep(5)
 
-    raise RuntimeError("SAP Export failed after 3 attempts.")
+    raise RuntimeError("SAP Export απέτυχε μετά από 3 απόπειρες.")
 
 # ==============================================================================
-# PHASE A.3 — Queries → FULL_RESULTS.xlsx
+# ΦΑΣΗ Α.3 — Queries → FULL_RESULTS.xlsx
 # ==============================================================================
 
 def phase_a_queries(df_final: pd.DataFrame) -> pd.DataFrame:
-    print("  Building queries...")
-    df_ger = pd.read_excel(GERAKARHS, sheet_name=0)
+    print("  Queries...")
+    df_ger = pd.read_excel(BROKER_XLSX, sheet_name=0)
     df_db  = pd.read_excel(DATABASE_XLSX, sheet_name=0)
 
     df_ger["MRN"]       = df_ger["MRN"].astype(str)
@@ -392,7 +643,7 @@ def phase_a_queries(df_final: pd.DataFrame) -> pd.DataFrame:
     df_gui["PDF NAME"] = df_gui["PDF NAME"].astype(str)
 
     if df_gui.empty:
-        show_info("⚠️  No PDF files found in SAP GUI folder.\nNo declarations to process.")
+        show_info("⚠️  Δεν υπάρχουν PDF στο SAP GUI folder.\nΚαμία διασάφηση προς καταχώρηση.")
         df_gui = pd.DataFrame({"PDF NAME": pd.Series([], dtype=str)})
 
     df_full = df_db.copy()
@@ -411,7 +662,7 @@ def phase_a_queries(df_final: pd.DataFrame) -> pd.DataFrame:
     o = o[o["_merge"]=="left_only"].drop(columns=["_merge"])
     o = o[~o["ΤΥΠΟΣ"].astype(str).str.endswith(("X","Y","Χ","Υ"),na=False)]
     o = o[~o["MRN"].astype(str).str.contains("GRIM0304",na=False)]
-    o = o[~o["MRN"].isin(["EXCLUDED_MRN_4","EXCLUDED_MRN_5"])]
+    o = o[~o["MRN"].isin(["YOUR_MRN_4","YOUR_MRN_5"])]
     o = o.merge(df_ger[["MRN","PROT","KATH","PDF"]], on="MRN", how="left", suffixes=("",".1"))
     o = o[o["PDF.1"].notna()]
     o = o[o["KATH"].astype(str) != "7100"]
@@ -472,14 +723,14 @@ def phase_a_queries(df_final: pd.DataFrame) -> pd.DataFrame:
     return df_opened
 
 # ==============================================================================
-# APPROVAL POPUP — Editable table
+# POPUP — Editable approval table
 # ==============================================================================
 
-# Columns visible in the popup
+# Στήλες που βλέπεις στο popup
 SHOW_COLS = ["MRN", "PROT", "PDF", "PDF.1", "ΚΑΤΑΣΤΑΣΗ",
              "ΚΡΑΜΑ_1", "ΒΑΡΟΣ_1", "ΚΡΑΜΑ_2", "ΒΑΡΟΣ_2", "ΚΡΑΜΑ_3", "ΒΑΡΟΣ_3"]
 
-# Editable columns
+# Στήλες που μπορείς να επεξεργαστείς
 EDIT_COLS = {"PROT", "PDF", "PDF.1",
              "ΚΡΑΜΑ_1", "ΒΑΡΟΣ_1", "ΚΡΑΜΑ_2", "ΒΑΡΟΣ_2", "ΚΡΑΜΑ_3", "ΒΑΡΟΣ_3"}
 
@@ -710,6 +961,7 @@ class ItemsPopup:
         self.mrn     = mrn
         self.result  = None
         self._edit_widget = None
+        self._commit_fn = None
 
         # Φτιάχνουμε dict με τιμές ανά Α/Α
         self.data = {}
@@ -833,19 +1085,34 @@ class ItemsPopup:
             fg="#1A1A1A", relief="solid", bd=1, insertbackground="#1A1A1A")
         e.place(x=x, y=y, width=w, height=h)
         e.insert(0, vals[ci]); e.select_range(0, "end"); e.focus_set()
+        committed = {"done": False}
         def commit(ev=None):
+            # Guard: αποτρέπει διπλή εκτέλεση (π.χ. FocusOut μετά από ήδη-συγχρονισμένο commit)
+            if committed["done"]:
+                return
+            committed["done"] = True
             vals[ci] = e.get().strip()
             self.tree.item(iid, values=vals)
             self.data[iid][cn] = vals[ci]
-            e.destroy(); self._edit_widget = None
+            try: e.destroy()
+            except tk.TclError: pass
+            if self._edit_widget is e:
+                self._edit_widget = None
+                self._commit_fn = None
         e.bind("<Return>", commit); e.bind("<Tab>", commit)
         e.bind("<Escape>", lambda ev: e.destroy()); e.bind("<FocusOut>", commit)
         self._edit_widget = e
+        self._commit_fn = commit
 
     def _commit(self):
-        if self._edit_widget:
-            try: self._edit_widget.event_generate("<FocusOut>")
-            except: pass
+        # Συγχρονισμένο commit του τρέχοντος ανοιχτού κελιού - ΟΧΙ μέσω
+        # event_generate (που είναι ασύγχρονο by default και προκαλούσε
+        # απώλεια τιμών σε γρήγορα διαδοχικά double-click).
+        if self._commit_fn:
+            try: self._commit_fn()
+            except tk.TclError: pass
+        self._edit_widget = None
+        self._commit_fn = None
 
     def _ok(self):
         self._commit()
@@ -1034,9 +1301,11 @@ def phase_b_download_xml(mrn: str, driver):
         xmls = list(SAVE_FOLDER.glob("*.xml"))
         if xmls:
             latest = max(xmls, key=lambda f: f.stat().st_ctime)
-            if XML_PATH.exists(): XML_PATH.unlink()
-            latest.rename(XML_PATH)
-            print(f"    XML saved: {XML_PATH.name}")
+            XML_DIR.mkdir(parents=True, exist_ok=True)
+            dest = XML_DIR / f"{mrn}.xml"
+            dest.unlink(missing_ok=True)
+            shutil.move(str(latest), str(dest))
+            print(f"    XML saved: {dest.name}")
             driver.minimize_window()
             return driver
 
@@ -1046,9 +1315,9 @@ def phase_b_download_xml(mrn: str, driver):
 # ΦΑΣΗ Β.2 — Parse XML
 # ==============================================================================
 
-def phase_b_parse_xml() -> pd.DataFrame:
+def phase_b_parse_xml(xml_path: Path) -> pd.DataFrame:
     import xml.etree.ElementTree as ET
-    tree = ET.parse(XML_PATH); root = tree.getroot()
+    tree = ET.parse(xml_path); root = tree.getroot()
 
     def fmt(d): return d.strftime("%d.%m.%Y")
     def to_comma(val):
@@ -1191,7 +1460,24 @@ def get_sap_win(timeout=10):
     return app.window(class_name="SAP_FRONTEND_SESSION", title=SAP_WIN_TITLE)
 
 
-def sap_entry(row, prot: str, sap_running: bool = False):
+ZIMP_BASE = "/app/con[0]/ses[0]/wnd[0]/usr/"
+
+
+def sap_entry(session, row, prot: str):
+    """
+    SAP GUI Scripting έκδοση — γεμίζει όλα τα πεδία της οθόνης "Νέες
+    Καταχωρίσεις" μέσω findById(...).text (όχι send_keys/TAB, άρα η σειρά
+    δεν έχει σημασία — κάθε πεδίο γράφεται απευθείας με το ID του).
+
+    ΣΤΑΜΑΤΑΕΙ ΑΚΡΙΒΩΣ ΠΡΙΝ ΤΟ SAVE: δεν πατάει ποτέ btn[11] (Save) ούτε F11.
+    Το session πρέπει να είναι ήδη στην οθόνη καταχώρησης (μετά το "Νέες
+    Καταχωρίσεις").
+
+    Ισοδυναμεί με το παλιό sap_entry() του IMA-IMC.py, field-by-field
+    (βλ. ima_mapping.txt) — καμία τιμή/κλάδος δεν έχει αλλάξει λογική.
+    """
+    B = ZIMP_BASE
+
     tl  = str(row["ΤΕΛΩΝ"]);  ty  = str(row["ΤΥΠΟΣ"]); mn  = str(row["MRN"])
     im  = str(row["ΗΜΕΡ"]);   dk  = str(row["ΔΑΣΜ_ΚΛ"]); aa = str(row["Α/Α"])
     xw  = str(row["ΧΩΡΑ"]);   x16 = str(row["X16"]); tk_ = str(row["ΤΕΛ_ΚΑΘ"])
@@ -1202,362 +1488,277 @@ def sap_entry(row, prot: str, sap_running: bool = False):
     da  = str(row["ΔΑΣΜ"]);   sf  = str(row["ΣΥΝΤ_ΦΠΑ"]); fp = str(row["ΦΠΑ"])
     ea  = str(row["ΕΝΤ_ΑΓ"]).strip(); ip = str(row["ΗΜΕΡ_ΠΡΟΘ"])
 
-    if x16 == "X16":             kath = 3
-    elif tk_ == "5111":          kath = 12
-    elif tk_.startswith("5"):    kath = 2
-    else:                        kath = 5
+    kath = compute_kath(x16, tk_)
 
-    # ── ΚΡΑΜΑ: για 0832+ΔΑΣΜ_ΚΛ παίρνει από τη γραμμή, αλλιώς get_kramma ──
-    popup_kr = str(row.get("ΚΡΑΜΑ", "")).strip()
-    if popup_kr and popup_kr not in ("nan", ""):
-        kr = popup_kr  # popup έχει προτεραιότητα πάντα
-    elif is_0832_kramma(row):
-        kr = popup_input("ΚΡΑΜΑ", f"ΤΕΛΩΝ=0832 | {dk}\nΕισάγετε ΚΡΑΜΑ:")
-    else:
-        kr = get_kramma(dk, sd)
-        if kr is None:
-            kr = popup_input("ΚΡΑΜΑ", f"Εισάγετε ΚΡΑΜΑ για {dk}:")
+    res = resolve_inputs(row, prot)
+    kr1, vr1 = res["ΚΡΑΜΑ_1"], res["ΒΑΡΟΣ_1"]
+    kr2, vr2 = res["ΚΡΑΜΑ_2"], res["ΒΑΡΟΣ_2"]
+    kr3, vr3 = res["ΚΡΑΜΑ_3"], res["ΒΑΡΟΣ_3"]
+    prot, ea = res["PROT"], res["ΕΝΤ_ΑΓ"]
+
+    log.info(
+        f"    Α/Α={aa} | ΚΑΘ={kath} | ΚΡΑΜΑ_1={kr1} | ΒΑΡΟΣ_1={vr1} | ΤΕΛΩΝ={tl} | "
+        f"ΣΥΝΤ_ΔΑΣΜ={sd} | ΔΑΣΜ={da} | ΣΥΝΤ_ΦΠΑ={sf} | ΦΠΑ={fp} | ΕΝΤ_ΑΓ(ea)={ea!r} | "
+        f"ΠΡΟΜ={pr} | ΟΡΟΙ={or_} | ΤΙΜΗ={ti} | ΒΑΡΟΣ={vr} | ΣΤΑΤ_ΑΞΙΑ={sa}"
+    )
+    _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot, ea)
+
+
+def resolve_inputs(row, prot: str) -> dict:
+    """Όλα τα popups μιας καταχώρησης (ΚΡΑΜΑ / ΠΡΟΤΙΜΗΣΗ / ΕΝΤΟΛΗ ΑΓΟΡΑΣ).
+    Καλείται στο Μέρος 1 (πριν ανοίξει το SAP) και οι απαντήσεις γράφονται
+    στη γραμμή — στο Μέρος 2 βρίσκει τις τιμές συμπληρωμένες και δεν ρωτάει ξανά."""
+    mn = str(row["MRN"]); dk = str(row["ΔΑΣΜ_ΚΛ"]); aa = str(row["Α/Α"])
+    sd = str(row["ΣΥΝΤ_ΔΑΣΜ"]); ea = str(row["ΕΝΤ_ΑΓ"]).strip()
+
+    # ── ΚΡΑΜΑΤΑ: έως 3 ζεύγη ΚΡΑΜΑ/ΒΑΡΟΣ σε ΜΙΑ καταχώρηση ──────────────
+    # Αν το row έχει ήδη ΚΡΑΜΑ_1/ΒΑΡΟΣ_1 (από το popup για 0832, βλ.
+    # prepare_mrn) τα χρησιμοποιούμε ως έχουν. Αλλιώς (γνωστό ΔΑΣΜ_ΚΛ) ένα
+    # μόνο κράμα από get_kramma() στη θέση 1, με όλο το βάρος.
+    kr1 = str(row.get("ΚΡΑΜΑ_1", "")).strip()
+    vr1 = str(row.get("ΒΑΡΟΣ_1", "")).strip()
+    kr2 = str(row.get("ΚΡΑΜΑ_2", "")).strip()
+    vr2 = str(row.get("ΒΑΡΟΣ_2", "")).strip()
+    kr3 = str(row.get("ΚΡΑΜΑ_3", "")).strip()
+    vr3 = str(row.get("ΒΑΡΟΣ_3", "")).strip()
+
+    if not kr1:
+        # Προτεραιότητα στο ΚΡΑΜΑ που εξάγεται αυτόματα από το XML (περιγραφή
+        # "SLABS <κωδικός>..." — βλ. parse_xml) — ίδια σειρά προτεραιότητας με
+        # τον παλιό κώδικα ("popup έχει προτεραιότητα πάντα"), εδώ για τη θέση 1.
+        xml_kr = str(row.get("ΚΡΑΜΑ", "")).strip()
+        if xml_kr and xml_kr not in ("nan", ""):
+            kr1 = xml_kr
+        elif is_0832_kramma(row):
+            kr1 = popup_input("ΚΡΑΜΑ", f"ΤΕΛΩΝ=0832 | {dk}\nΕισάγετε ΚΡΑΜΑ (1ο):")
+        else:
+            kr1 = get_kramma(dk, sd)
+            if kr1 is None:
+                kr1 = popup_input("ΚΡΑΜΑ", f"Εισάγετε ΚΡΑΜΑ για {dk}:")
+        # ΒΑΡΟΣ_1 μένει κενό (όπως ο παλιός κώδικας) όταν υπάρχει μόνο ένα
+        # κράμα — το συνολικό βάρος καλύπτεται ήδη από το ΠΟΣΟΤΗΤΑ ΕΙΣΑΓΩΓΗΣ
+        # (vr, πεδίο MENGE). Το ΒΑΡΟΣ_1 γεμίζει μόνο όταν υπάρχουν 2+ κράματα
+        # (βλ. expand_krammata: "ΚΡΑΜΑ_1 μόνο → ΒΑΡΟΣ_1 κενό, συνολικό βάρος").
 
     if not prot or prot in ("", "nan"):
         prot = popup_input("ΠΡΟΤΙΜΗΣΗ", f"MRN:{mn}|Α/Α:{aa}\nΕισάγετε ΠΡΟΤΙΜΗΣΗ:")
         if not prot: raise ValueError("ΠΡΟΤΙΜΗΣΗ κενή")
 
     if sd != "24" and ea in ("", "nan", "None"):
-
         raw = popup_input("ΕΝΤΟΛΗ ΑΓΟΡΑΣ", f"MRN:{mn}\n5 ψηφία ΕΝΤ_ΑΓ (ή NO):")
         if raw:
             ea = "NO" if raw.upper() == "NO" else f"41000{raw.strip()}"
 
-    print(f"    Α/Α={aa} | ΚΑΘ={kath} | ΚΡΑΜΑ={kr} | ΒΑΡΟΣ={vr} | ΤΕΛΩΝ={tl}")
+    # Το πεδίο EBELN στο SAP δέχεται ΑΚΡΙΒΩΣ 10 χαρακτήρες — οτιδήποτε άλλο
+    # σκάει στο session.findById(...).text = ea με "Property can not be set"
+    # (confirmed live 2026-10-01, MRN YOUR_MRN_6: ea είχε 13 χαρακτήρες
+    # αντί για 10). Αντί να σκάσει, ζητάμε διόρθωση από τον χρήστη.
+    while sd != "24" and ea.upper() != "NO" and len(ea) != 10:
+        raw = popup_input(
+            "ΕΝΤΟΛΗ ΑΓΟΡΑΣ — ΛΑΘΟΣ ΜΗΚΟΣ",
+            f"MRN:{mn}\nΗ τιμή '{ea}' έχει {len(ea)} χαρακτήρες (πρέπει ΑΚΡΙΒΩΣ 10).\n"
+            f"Διόρθωσε (ή γράψε NO):",
+            default=ea,
+        )
+        if not raw:
+            raise ValueError(f"ΕΝΤΟΛΗ ΑΓΟΡΑΣ μη έγκυρη (ακυρώθηκε): {ea!r}")
+        ea = "NO" if raw.upper() == "NO" else raw.strip()
 
-    if not sap_running:
-        close_sap(); time.sleep(2)
-        setup_keyboard()
-        subprocess.Popen(f'start "" "{SAP_FILE_B}"', shell=True); time.sleep(2.5)
-        ap = Application(backend="uia").connect(title="ZELVMM_IMP_1", timeout=60)
-        wn = ap.window(title="ZELVMM_IMP_1")
-        wn.child_window(auto_id="1004", control_type="Edit")\
-          .wait("exists enabled visible", timeout=30).set_text(SAP_USER)
-        wn.child_window(auto_id="1005", control_type="Edit").set_text(SAP_PASS)
-        wn.child_window(title="Εισ.σε Σύστ.", control_type="Button").click_input()
-        time.sleep(3)
-
-
-        # Στέλνουμε τα TABs απευθείας στο "Επιλογή Πεδίου"
-        # Επιλογή Πεδίου
-        print("Ψάχνω Επιλογή Πεδίου...")
-        while True:
-            try:
-                dlg = Application(backend="uia").connect(title="Επιλογή Πεδίου", timeout=2)
-                win_dlg = dlg.window(title="Επιλογή Πεδίου")
-                win_dlg.set_focus()
-                hwnd = win_dlg.handle
-                fore_hwnd = ctypes.windll.user32.GetForegroundWindow()
-                fore_tid = ctypes.windll.user32.GetWindowThreadProcessId(fore_hwnd, None)
-                this_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-                ctypes.windll.user32.AttachThreadInput(this_tid, fore_tid, True)
-                ctypes.windll.user32.SetForegroundWindow(hwnd)
-                ctypes.windll.user32.AttachThreadInput(this_tid, fore_tid, False)
-                time.sleep(1)
-                break
-            except:
-                time.sleep(0.5)
-
-        pyautogui.hotkey("tab")
-        pyautogui.hotkey("tab")
-        pyautogui.hotkey("tab")
-        pyautogui.hotkey("tab")
-        pyautogui.hotkey("space")
-        pyautogui.hotkey("enter")
-
-        time.sleep(1)
-
-        send_keys("1100{ENTER}", pause=0.05)
-        time.sleep(1)
-        print("Έστειλε την εταιρεία")
-    for _ in range(10):
-        try:
-            ap2 = Application(backend="uia").connect(title_re=".*Επισκόπηση.*", timeout=5)
-            wn2 = ap2.window(title_re=".*Επισκόπηση.*"); wn2.maximize()
-            try:
-                Application(backend="uia").connect(title="Πληροφορίες", timeout=2)
-                wn2.close(); time.sleep(1)
-                setup_keyboard()
-                subprocess.Popen(f'start "" "{SAP_FILE_B}"', shell=True); time.sleep(2.5)
-                wr = Application(backend="uia").connect(title="ZELVMM_IMP_1", timeout=60)\
-                       .window(title="ZELVMM_IMP_1")
-                wr.child_window(auto_id="1004", control_type="Edit")\
-                  .wait("exists enabled visible", timeout=30).set_text(SAP_USER)
-                wr.child_window(auto_id="1005", control_type="Edit").set_text(SAP_PASS)
-                wr.child_window(title="Εισ.σε Σύστ.", control_type="Button").click_input()
-                time.sleep(3)
-                # Επιλογή Πεδίου
-                print("Ψάχνω Επιλογή Πεδίου...")
-                while True:
-                    try:
-                        dlg = Application(backend="uia").connect(title="Επιλογή Πεδίου", timeout=2)
-                        win_dlg = dlg.window(title="Επιλογή Πεδίου")
-                        win_dlg.set_focus()
-                        hwnd = win_dlg.handle
-                        fore_hwnd = ctypes.windll.user32.GetForegroundWindow()
-                        fore_tid = ctypes.windll.user32.GetWindowThreadProcessId(fore_hwnd, None)
-                        this_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-                        ctypes.windll.user32.AttachThreadInput(this_tid, fore_tid, True)
-                        ctypes.windll.user32.SetForegroundWindow(hwnd)
-                        ctypes.windll.user32.AttachThreadInput(this_tid, fore_tid, False)
-                        time.sleep(1)
-                        break
-                    except:
-                        time.sleep(0.5)
-                pyautogui.hotkey("tab")
-                pyautogui.hotkey("tab")
-                pyautogui.hotkey("tab")
-                pyautogui.hotkey("tab")
-                pyautogui.hotkey("space")
-                pyautogui.hotkey("enter")
-
-                time.sleep(1)
-                # 1100 + ENTER
-                print("Sending company code 1100...")
-                send_keys("1100{ENTER}", pause=0.05)
-                time.sleep(1)
-                print("Done!")
-            except: pass
-            break
-        except: time.sleep(1)
-
-    # Step 1: Wait for overview window
-    while True:
-        try:
-            ap2 = Application(backend="uia").connect(title_re=".*Επισκόπηση.*", timeout=5)
-            wn2 = ap2.window(title_re=".*Επισκόπηση.*")
-            wn2.maximize()
-            break
-        except:
-            time.sleep(2)
-
-    # Step 2: Click Change — if info dialog opens, click Continue and retry
-    while True:
-        try:
-            wn2.child_window(title="Εμφάνιση -> Αλλαγή", control_type="Button") \
-                .wait("exists enabled visible", timeout=30).click_input()
-            time.sleep(2)
-
-            # Check if info dialog opened
-            try:
-                wn2.child_window(class_name_re=".*:00000000:00000000", title="AppToolbar") \
-                    .child_window(title="Συνέχεια", class_name="Button") \
-                    .wait("exists enabled visible", timeout=3).click_input()
-                print("  Another user active — Continue and retry...")
-                time.sleep(1)
-                continue
-            except:
-                pass
-
-            # Step 3: Click New Entries — wait until available
-            while True:
-                try:
-                    ap3 = Application(backend="uia").connect(title_re=".*Αλλαγή.*Επισκόπηση.*", timeout=5)
-                    wn3 = ap3.window(title_re=".*Αλλαγή.*Επισκόπηση.*")
-                    wn3.child_window(title="Νέες Καταχωρίσεις", control_type="Button") \
-                        .wait("exists enabled visible", timeout=30).click_input()
-                    time.sleep(1)
-                    print("  New Entries OK!")
-                    # Maximise the new entries window
-                    while True:
-                        try:
-                            ap4 = Application(backend="uia").connect(title=SAP_WIN_TITLE, timeout=10)
-                            ap4.window(title=SAP_WIN_TITLE).maximize()
-                            break
-                        except:
-                            time.sleep(1)
-                    break
-                except:
-                    time.sleep(1)
-            break
-        except:
-            time.sleep(1)
+    return {"ΚΡΑΜΑ_1": kr1, "ΒΑΡΟΣ_1": vr1, "ΚΡΑΜΑ_2": kr2, "ΒΑΡΟΣ_2": vr2,
+            "ΚΡΑΜΑ_3": kr3, "ΒΑΡΟΣ_3": vr3, "PROT": prot, "ΕΝΤ_ΑΓ": ea}
 
 
+def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot, ea):
+    """Γέμισμα πεδίων (αμετάβλητη λογική από την προηγούμενη έκδοση του sap_entry)."""
+    tl  = str(row["ΤΕΛΩΝ"]);  ty  = str(row["ΤΥΠΟΣ"]); mn  = str(row["MRN"])
+    im  = str(row["ΗΜΕΡ"]);   dk  = str(row["ΔΑΣΜ_ΚΛ"]); aa = str(row["Α/Α"])
+    xw  = str(row["ΧΩΡΑ"]);   x16 = str(row["X16"]); tk_ = str(row["ΤΕΛ_ΚΑΘ"])
+    il  = str(row["ΗΜΕΡ_ΛΗΞΗΣ"]); il2 = str(row["ΗΜΕΡ_ΛΗΞΗΣ2"])
+    vr  = str(row["ΒΑΡΟΣ"]);  sa  = str(row["ΣΤΑΤ_ΑΞΙΑ"]); ns = str(row["ΝΟΜ_ΣΤΑΤ"])
+    pr  = str(row["ΠΡΟΜ"]);   or_ = str(row["ΟΡΟΙ"]); ti = str(row["ΤΙΜΗ"])
+    ni  = str(row["ΝΟΜ_ΙΣΟΤ"]); is_ = str(row["ΙΣΟΤ"]); sd = str(row["ΣΥΝΤ_ΔΑΣΜ"])
+    da  = str(row["ΔΑΣΜ"]);   sf  = str(row["ΣΥΝΤ_ΦΠΑ"]); fp = str(row["ΦΠΑ"])
+    ip  = str(row["ΗΜΕΡ_ΠΡΟΘ"])
+
+    # ── Βασικά πεδία κεφαλίδας ────────────────────────────────────────────
+    session.findById(B + "ctxtZIMP_1-ZOLLA").text = tl
+    session.findById(B + "txtZIMP_1-ZOLLA_TYPE_B").text = ty
+    session.findById(B + "ctxtZIMP_1-ZIMPT").text = mn
+    session.findById(B + "ctxtZIMP_1-ZDATE").text = im
     if tl != "0832":
-        send_keys(f"{tl}{{TAB}}{tl}{{TAB}}{ty}{{TAB}}{{TAB}}"
-                  f"{mn}{{TAB}}{mn}{{TAB}}{{TAB}}"
-                  f"{im}{{TAB}}{im}{{TAB}}{{TAB}}"
-                  f"{dk}{{TAB}}{{TAB}}1100{{TAB}}{aa}{{TAB}}{xw}{{TAB}}", pause=0.05)
-    else:
-        send_keys(f"{tl}{{TAB}}{{TAB}}{ty}{{TAB}}{{TAB}}"
-                  f"{mn}{{TAB}}{{TAB}}{{TAB}}"
-                  f"{im}{{TAB}}{{TAB}}{{TAB}}"
-                  f"{dk}{{TAB}}{{TAB}}1100{{TAB}}{aa}{{TAB}}{xw}{{TAB}}", pause=0.05)
+        session.findById(B + "txtZIMP_1-ZOLLA_B").text = tl
+        session.findById(B + "txtZIMP_1-ZIMPT_B").text = mn
+        session.findById(B + "ctxtZIMP_1-ZDATE_B").text = im
+    session.findById(B + "ctxtZIMP_1-STAWN").text = dk
+    session.findById(B + "ctxtZIMP_1-BUKRS").text = COMPANY_CODE
+    session.findById(B + "txtZIMP_1-ZAA").text = aa
+    session.findById(B + "ctxtZIMP_1-ZLAND").text = xw
 
-    send_keys(f"{kath}{{TAB}}{tk_}{{TAB}}", pause=0.05)
+    # ── Καθεστώς ──────────────────────────────────────────────────────────
+    session.findById(B + "ctxtZIMP_1-Z_IMP").text = str(kath)
+    session.findById(B + "txtZIMP_1-Z_IMP_TEL").text = tk_
 
-    is_swan = (kath == 3 and tk_ == "6121" and pr == "SUPPLIER_NAME_PASSIVE" and dk == "76012080")
-    if is_swan:
-        send_keys(f"{il}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}"
-                  f"AUTH_NUMBER_PASSIVE{{TAB}}"
-                  f"{vr}{{TAB}}KG{{TAB}}{sa}{{TAB}}{ns}{{TAB}}"
-                  f"{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{SPACE}}{{TAB}}{{TAB}}", pause=0.05)
-        send_keys("SUPPLIER_NAME_PASSIVE - ΠΑΘΗΤΙΚΗ ΤΕΛ.", with_spaces=True, pause=0.05)
-        send_keys("{TAB}{TAB}{TAB}{TAB}{TAB}{TAB}{TAB}{TAB}AUTH_DECISION_X16{TAB}{TAB}AL{TAB}{TAB}{TAB}{TAB}{TAB}{TAB}\n",pause=0.05)
+    is_special = (kath == 3 and tk_ == "6121" and pr == "SUPPLIER_X LTD" and dk == "76012080")
 
-        if sd == "24":
-            send_keys(f"{prot}{{TAB}}{{TAB}}{or_}{{TAB}}{ti}{{TAB}}{{TAB}}"
-                      f"{ni}{{TAB}}{{TAB}}{is_}{{TAB}}{{TAB}}"
-                      f"{sa}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}"
-                      f"{sf}{{TAB}}{{TAB}}{fp}", pause=0.05)
-        else:
-            send_keys(f"{prot}{{TAB}}{{TAB}}{or_}{{TAB}}{ti}{{TAB}}{{TAB}}"
-                      f"{ni}{{TAB}}{{TAB}}{is_}{{TAB}}{{TAB}}"
-                      f"{sa}{{TAB}}{{TAB}}{sd}{{TAB}}{da}{{TAB}}{{TAB}}"
-                      f"{sf}{{TAB}}{{TAB}}{fp}", pause=0.05)
-            if ea.upper() == "NO":
-                send_keys("{TAB}{TAB}{ENTER}", pause=0.05)
-            else:
-                send_keys(f"{{TAB}}{{TAB}}{ea}{{ENTER}}", pause=0.05)
+    if is_special:
+        session.findById(B + "ctxtZIMP_1-ZDUED").text = il
+        session.findById(B + "txtZIMP_1-ZDOCDYN").text = "YOUR_DOC_REF_1"
+        session.findById(B + "txtZIMP_1-MENGE").text = vr
+        session.findById(B + "ctxtZIMP_1-MEINS").text = "KG"
+        session.findById(B + "txtZIMP_1-VALUE").text = sa
+        session.findById(B + "txtZIMP_1-ZWRBTR_EUR_42").text = sa
+        session.findById(B + "ctxtZIMP_1-WAERS").text = ns
 
-        send_keys("{ENTER}")
-        time.sleep(0.5)
-        win = get_sap_win()
-        win.set_focus()
-        time.sleep(0.5)
-        send_keys("{F11}")
+        pr = "SUPPLIER_X - ΠΑΘΗΤΙΚΗ ΤΕΛ."
+        session.findById(B + "txtZIMP_1-ZLFINN").text = pr
+        session.findById(B + "txtZIMP_1-ZPSAPOF").text = "YOUR_PERMIT_REF"
+        session.findById(B + "ctxtZIMP_1-ZQM_ALLOY").text = "AL"
 
-        time.sleep(0.5); return
+        session.findById(B + "txtZIMP_1-ZPREFERENCE").text = prot
+        session.findById(B + "txtZIMP_1-ZDELIV_TERMS").text = or_
+        session.findById(B + "txtZIMP_1-ZWRBTR_42").text = ti
+        session.findById(B + "txtZIMP_1-ZWAERS_42").text = ni
+        session.findById(B + "txtZIMP_1-ZKURSF_42").text = is_
+        session.findById(B + "txtZIMP_1-VALUE").text = sa
+        session.findById(B + "txtZIMP_1-ZWRBTR_EUR_42").text = sa
+        if sd != "24":
+            session.findById(B + "txtZIMP_1-ZKBERT_DUTIES_42").text = sd
+            session.findById(B + "txtZIMP_1-ZWRBTR_DUTIES_42").text = da
+        session.findById(B + "txtZIMP_1-ZKBERT_TAXES_42").text = sf
+        session.findById(B + "txtZIMP_1-ZWRBTR_TAXES_42").text = fp
+        if sd != "24" and ea.upper() != "NO":
+            session.findById(B + "ctxtZIMP_1-EBELN").text = ea
 
-    if kath == 3:         send_keys(f"{il}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}", pause=0.05)
-    elif kath in (5, 12): send_keys("{TAB}{TAB}{TAB}{TAB}{TAB}", pause=0.05)
-    else:                 send_keys(f"{il2}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}AUTH_NUMBER_IP", pause=0.05)
+        session.findById(B + "chkZIMP_1-ZCHECK").Selected = True
+        print("    [SUPPLIER_X] Στοιχεία γεμίστηκαν — ΣΤΑΜΑΤΗΣΕ πριν το Save.")
+        return
 
-    send_keys(f"{{TAB}}{vr}{{TAB}}KG{{TAB}}{sa}{{TAB}}{ns}{{TAB}}{{TAB}}", pause=0.05)
+    # ── Μη-SUPPLIER_X μονοπάτι ─────────────────────────────────────────────────
+    if kath == 3:
+        session.findById(B + "ctxtZIMP_1-ZDUED").text = il
+    elif kath in (5, 12):
+        pass
+    else:  # kath == 2
+        session.findById(B + "ctxtZIMP_1-ZDUED").text = il2
+        session.findById(B + "txtZIMP_1-ZDOCDYN").text = "23GR000001IP00242"
+
+    session.findById(B + "txtZIMP_1-MENGE").text = vr
+    session.findById(B + "ctxtZIMP_1-MEINS").text = "KG"
+    session.findById(B + "txtZIMP_1-VALUE").text = sa
+    session.findById(B + "txtZIMP_1-ZWRBTR_EUR_42").text = sa
+    session.findById(B + "ctxtZIMP_1-WAERS").text = ns
 
     if sd == "24":
-        focus_sap(); send_keys("+%(1)", pause=0.05); time.sleep(0.5)
         pr = f"ΦΥΡΑ - ΕΚΚΑΘΑΡΙΣΗ {im}"
 
     is_c = ty.upper().endswith("C")
-    if is_c:
-        if kath == 2:
-            send_keys(f"AUTH_NUMBER_IP_CGU{{TAB}}{{TAB}}AUTH_NUMBER_BOND_IP{{TAB}}{{SPACE}}{{TAB}}"
-                      f"AUTH_NUMBER_SASP_IP{{TAB}}", pause=0.05)
-            send_keys(pr, with_spaces=True, pause=0.05)
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{ip}{{TAB}}{{TAB}}AUTH_DECISION_IP", pause=0.05)
-        elif kath == 3:
-            send_keys(f"AUTH_NUMBER_X16_CGU{{TAB}}{{TAB}}AUTH_NUMBER_BOND_X16{{TAB}}{{SPACE}}{{TAB}}"
-                      f"AUTH_NUMBER_SASP_X16{{TAB}}", pause=0.05)
-            send_keys(pr, with_spaces=True, pause=0.05)
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}AUTH_DECISION_X16", pause=0.05)
-        elif kath == 5:
-            send_keys(f"AUTH_NUMBER_X16_CGU{{TAB}}{{TAB}}AUTH_NUMBER_BOND_X16{{TAB}}{{SPACE}}{{TAB}}"
-                      f"AUTH_NUMBER_SASP_X16{{TAB}}", pause=0.05)
-            send_keys(pr, with_spaces=True, pause=0.05)
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}.", pause=0.05)
-    else:
-        if kath == 2:
-            send_keys(f"AUTH_NUMBER_IP_CGU{{TAB}}{{TAB}}AUTH_NUMBER_BOND_IP{{TAB}}{{SPACE}}{{TAB}}{{TAB}}",
-                      pause=0.05)
-            send_keys(pr, with_spaces=True, pause=0.05)
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{ip}{{TAB}}{{TAB}}AUTH_DECISION_IP", pause=0.05)
-        elif kath == 3:
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{SPACE}}{{TAB}}{{TAB}}", pause=0.05)
-            send_keys(pr, with_spaces=True, pause=0.05)
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}AUTH_DECISION_X16", pause=0.05)
-        elif kath in (5, 12):
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{SPACE}}{{TAB}}{{TAB}}", pause=0.05)
-            send_keys(pr, with_spaces=True, pause=0.05)
-            send_keys(f"{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}.", pause=0.05)
 
-    send_keys(f"{{TAB}}{{TAB}}{kr}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}", pause=0.05)
+    # Hardcoded reference documents (βλ. ima_mapping.txt) — ταυτόσημο με τον
+    # παλιό κώδικα, ΣΥΜΠΕΡΙΛΑΜΒΑΝΟΜΕΝΟΥ του edge case: αν is_c ΚΑΙ ΚΑΘ==12,
+    # ο παλιός κώδικας δεν έγραφε ΤΙΠΟΤΑ εδώ (ούτε καν ΠΡΟΜ/ZLFINN) — το ίδιο κρατάμε.
+    if kath == 2:
+        session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "YOUR_DOC_REF_2"
+        session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = "YOUR_DOC_REF_3"
+        session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "18GR000001SASP00058"
+        session.findById(B + "txtZIMP_1-ZLFINN").text = pr
+        session.findById(B + "ctxtZIMP_1-ZDATANT").text = ip
+        session.findById(B + "txtZIMP_1-ZPSAPOF").text = "10790/13-06-2003"
+    elif kath == 3:
+        if is_c:
+            session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "18GR000001CGU1CT000004"
+            session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = "YOUR_DOC_REF_4"
+            session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "18GR000001SASP00057"
+        session.findById(B + "txtZIMP_1-ZLFINN").text = pr
+        session.findById(B + "txtZIMP_1-ZPSAPOF").text = "YOUR_PERMIT_REF"
+    elif kath == 5:
+        if is_c:
+            session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "18GR000001CGU1CT000004"
+            session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = "YOUR_DOC_REF_4"
+            session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "18GR000001SASP00057"
+        session.findById(B + "txtZIMP_1-ZLFINN").text = pr
+        session.findById(B + "txtZIMP_1-ZPSAPOF").text = "."
+    elif kath == 12:
+        if not is_c:
+            session.findById(B + "txtZIMP_1-ZLFINN").text = pr
+            session.findById(B + "txtZIMP_1-ZPSAPOF").text = "."
+        # is_c και ΚΑΘ==12: όπως ο παλιός κώδικας — δεν γράφεται τίποτα εδώ.
 
+    # ── Κράματα (έως 3 ζεύγη) ────────────────────────────────────────────
+    session.findById(B + "ctxtZIMP_1-ZQM_ALLOY").text = kr1
+    session.findById(B + "txtZIMP_1-ZQM_ALLOY_MENGE").text = vr1
+    if kr2:
+        session.findById(B + "ctxtZIMP_1-ZQM_ALLOY_2").text = kr2
+        session.findById(B + "txtZIMP_1-ZQM_ALLOY_2_MENGE").text = vr2
+    if kr3:
+        session.findById(B + "ctxtZIMP_1-ZQM_ALLOY_3").text = kr3
+        session.findById(B + "txtZIMP_1-ZQM_ALLOY_3_MENGE").text = vr3
+
+    # ── Προμηθευτής / Όροι / Τιμή / Ισοτιμία ────────────────────────────
+    session.findById(B + "txtZIMP_1-ZPREFERENCE").text = prot
+    session.findById(B + "txtZIMP_1-ZDELIV_TERMS").text = or_
+    session.findById(B + "txtZIMP_1-ZWRBTR_42").text = ti
+    session.findById(B + "txtZIMP_1-ZWAERS_42").text = ni
+    session.findById(B + "txtZIMP_1-ZKURSF_42").text = is_
+    session.findById(B + "txtZIMP_1-VALUE").text = sa
+    session.findById(B + "txtZIMP_1-ZWRBTR_EUR_42").text = sa
+
+    # ── Δασμός / ΦΠΑ ─────────────────────────────────────────────────────
     if sd == "24":
-        send_keys(f"{prot}{{TAB}}{{TAB}}{or_}{{TAB}}{ti}{{TAB}}{{TAB}}"
-                  f"{ni}{{TAB}}{{TAB}}{is_}{{TAB}}{{TAB}}"
-                  f"{sa}{{TAB}}{{TAB}}{{TAB}}{{TAB}}{{TAB}}"
-                  f"{sf}{{TAB}}{{TAB}}{fp}", pause=0.05)
+        session.findById(B + "txtZIMP_1-ZKBERT_TAXES_42").text = sf
+        session.findById(B + "txtZIMP_1-ZWRBTR_TAXES_42").text = fp
     else:
-        send_keys(f"{prot}{{TAB}}{{TAB}}{or_}{{TAB}}{ti}{{TAB}}{{TAB}}"
-                  f"{ni}{{TAB}}{{TAB}}{is_}{{TAB}}{{TAB}}"
-                  f"{sa}{{TAB}}{{TAB}}{sd}{{TAB}}{da}{{TAB}}{{TAB}}"
-                  f"{sf}{{TAB}}{{TAB}}{fp}", pause=0.05)
-        if ea.upper() == "NO": send_keys("{TAB}{TAB}{ENTER}", pause=0.05)
-        else: send_keys(f"{{TAB}}{{TAB}}{ea}{{ENTER}}", pause=0.05)
+        session.findById(B + "txtZIMP_1-ZKBERT_DUTIES_42").text = sd
+        session.findById(B + "txtZIMP_1-ZWRBTR_DUTIES_42").text = da
+        session.findById(B + "txtZIMP_1-ZKBERT_TAXES_42").text = sf
+        session.findById(B + "txtZIMP_1-ZWRBTR_TAXES_42").text = fp
+        if ea.upper() != "NO":
+            session.findById(B + "ctxtZIMP_1-EBELN").text = ea
 
-    send_keys("{ENTER}")
-    time.sleep(0.5)
-    win = get_sap_win()
-    win.set_focus()
-    time.sleep(0.5)
-    send_keys("{F11}")
-    time.sleep(0.5)
+    # ── Checkbox επιλογής γραμμής (πριν το Save) ────────────────────────
+    session.findById(B + "chkZIMP_1-ZCHECK").Selected = True
+
+    print("    Στοιχεία γεμίστηκαν — ΣΤΑΜΑΤΗΣΕ πριν το Save (δεν πατήθηκε τίποτα).")
 
 # ==============================================================================
 # ΦΑΣΗ Β.4 — SAP attach PDF
 # ==============================================================================
 
-def sap_attach(mrn: str, typos: str):
-    pdf_name = f"{mrn} {typos}.pdf"
-    full_path = str(SAP_GUI_DIR / pdf_name)
-    print(f"    Attaching: {pdf_name}")
+def sap_attach(session, pdf_path: Path):
+    """
+    GOS attach μέσω SAP GUI Scripting (Generic Object Services) — ίδιο
+    pattern με το ήδη validated attach_pdf_gos() του ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ
+    script, adapted από recording του χρήστη στο IMA/C. Επιβεβαιώνει μέσω
+    status bar πριν συνεχίσει.
+    """
+    session.findById("wnd[0]/titl/shellcont/shell").pressContextButton("%GOS_TOOLBOX")
+    session.findById("wnd[0]/titl/shellcont/shell").selectContextMenuItem("%GOS_PCATTA_CREA")
+    session.findById("wnd[1]/usr/ctxtDY_PATH").text = str(pdf_path.parent)
+    session.findById("wnd[1]/usr/ctxtDY_FILENAME").text = pdf_path.name
+    session.findById("wnd[1]/tbar[0]/btn[0]").press()
 
-    for attempt in range(5):
-        try:
-            wn = get_sap_win(); wn.set_focus(); time.sleep(0.3)
-            split = (wn.child_window(class_name="GOSContainer Class")
-                       .child_window(class_name="Shell Window Class", found_index=0)
-                       .child_window(class_name_re="ATL:.*", found_index=0)
-                       .child_window(class_name="SysPager")
-                       .child_window(class_name="ToolbarWindow32")
-                       .child_window(control_type="SplitButton"))
-            split.click_input(); time.sleep(0.7); break
-        except Exception as e:
-            if attempt == 4: raise RuntimeError(f"GOS SplitButton: {e}")
-            time.sleep(3)
+    status_text = ""
+    for _ in range(20):
+        status_text = session.findById("wnd[0]/sbar/pane[0]").text
+        if "Προσάρτηση δημιουργήθηκε με επιτυχία" in status_text:
+            break
+        time.sleep(0.5)
+    else:
+        raise RuntimeError(f"Δεν επιβεβαιώθηκε το attach. Status bar: '{status_text}'")
 
-    for attempt in range(5):
-        try:
-            wn = get_sap_win()
-            zg = wn.child_window(class_name="DialogBox Container Class", title_re="ZGOS_ZIMP1.*")
-            tb = (zg.child_window(class_name="Shell Window Class", found_index=0)
-                    .child_window(class_name_re="ATL:.*", found_index=0)
-                    .child_window(class_name="SysPager")
-                    .child_window(class_name="ToolbarWindow32"))
-            tb.children()[0].click_input(); time.sleep(0.7); break
-        except Exception as e:
-            if attempt == 4: raise RuntimeError(f"Button[0]: {e}")
-            time.sleep(3)
-
-    for attempt in range(5):
-        try:
-            ct = Application(backend="uia").connect(title="Context", class_name="#32768", timeout=5)
-            ct.window(title="Context", class_name="#32768")\
-              .child_window(title="Δημιουργία Προσάρτησης", control_type="MenuItem").click_input()
-            time.sleep(1); break
-        except Exception as e:
-            if attempt == 4: raise RuntimeError(f"MenuItem: {e}")
-            time.sleep(2)
-
-    def get_file_dlg():
-        wn = get_sap_win()
-        zg = wn.child_window(class_name="DialogBox Container Class", title_re="ZGOS_ZIMP1.*")
-        return zg.child_window(class_name="#32770", title="Εισαγωγή αρχείου")
-
-    for attempt in range(5):
-        try:
-            dlg = get_file_dlg()
-            dlg.child_window(class_name="Edit", title="File name:").set_edit_text(full_path)
-            time.sleep(0.3)
-            dlg.child_window(class_name="Button", title="Open").click_input(); break
-        except Exception as e:
-            if attempt == 4: raise RuntimeError(f"File/Open: {e}")
-            time.sleep(4)
-
-    time.sleep(4); print(f"    Attached OK: {pdf_name}")
+    print(f"    Attached OK: {pdf_path.name}")
 
 # ==============================================================================
 # PROCESS ONE MRN
 # ==============================================================================
 
-def process_mrn(row: dict, driver) -> bool:
+def prepare_mrn(row: dict, driver) -> tuple:
+    """
+    Μέρος 1 (μόνο ICISNet, το SAP είναι κλειστό): XML (από τον φάκελο xml
+    αν υπάρχει, αλλιώς λήψη) -> έλεγχος MRN -> parse -> φίλτρα -> κράματα ->
+    ΟΛΑ τα popups (ΚΡΑΜΑ / ΠΡΟΤΙΜΗΣΗ / ΕΝΤΟΛΗ ΑΓΟΡΑΣ) για κάθε Α/Α.
+    Επιστρέφει (job | None, status, driver) — status: 'ok' / 'skip' / 'fail'.
+    Το driver μπορεί να είναι None (ανοίγει μόνο αν χρειαστεί λήψη).
+    """
     mrn  = str(row.get("MRN",  "")).strip()
     prot = str(row.get("PROT", "")).strip()
     pdf  = str(row.get("PDF",  "")).strip()
@@ -1569,7 +1770,7 @@ def process_mrn(row: dict, driver) -> bool:
     if prot and prot.replace(".", "").isdigit():
         prot = str(int(float(prot)))
 
-    # Alloy data from the approval popup (for customs office 0832)
+    # Κράματα από το 1ο popup (για 0832)
     krammata_from_popup = {
         "ΚΡΑΜΑ_1": str(row.get("ΚΡΑΜΑ_1", "")).strip(),
         "ΒΑΡΟΣ_1":  str(row.get("ΒΑΡΟΣ_1",  "")).strip(),
@@ -1579,127 +1780,173 @@ def process_mrn(row: dict, driver) -> bool:
         "ΒΑΡΟΣ_3":  str(row.get("ΒΑΡΟΣ_3",  "")).strip(),
     }
 
-    print(f"\n{'='*60}")
-    print(f"  MRN : {mrn}  |  PROT: {prot}")
-    print(f"  PDF : {pdf1} -> {pdf}")
-    print(f"{'='*60}")
+    log.info(f"\n{'='*60}\n  MRN : {mrn}  |  PROT: {prot}\n  PDF : {pdf1} -> {pdf}\n{'='*60}")
 
     SAVE_FOLDER.mkdir(parents=True, exist_ok=True)
-    if XML_PATH.exists(): XML_PATH.unlink()
+    xml_path = XML_DIR / f"{mrn}.xml"
 
-    # B.1 Download XML
+    # Β.1 XML — από τον φάκελο αν υπάρχει, αλλιώς λήψη
+    t_step = perf_counter()
+    if xml_path.exists():
+        log.info(f"  XML από τον φάκελο: {xml_path.name}")
+    else:
+        try:
+            driver = phase_b_download_xml(mrn, driver)
+        except Exception as e:
+            log.exception(f"  Download XML failed: {e}"); save_screenshot(f"{mrn}_download_ERROR")
+            return None, "fail", driver
+        log.info(f"  [χρόνος] Download XML: {fmt_duration(perf_counter() - t_step)}")
+
+    # Β.2 Parse XML + έλεγχος ότι το XML είναι όντως αυτού του MRN
+    t_step = perf_counter()
     try:
-        driver = phase_b_download_xml(mrn, driver)
+        df_result = phase_b_parse_xml(xml_path)
+        xml_mrn = str(df_result["MRN"].iloc[0]).strip() if len(df_result) else ""
+        if xml_mrn != mrn:
+            xml_path.unlink(missing_ok=True)
+            raise ValueError(f"λάθος αρχείο — το XML είναι του {xml_mrn or '?'} (διαγράφηκε)")
     except Exception as e:
-        print(f"  Download XML failed: {e}"); traceback.print_exc(); return False
+        log.exception(f"  Parse XML failed: {e}"); save_screenshot(f"{mrn}_parse_ERROR")
+        return None, "fail", driver
+    log.info(f"  [χρόνος] Parse XML: {fmt_duration(perf_counter() - t_step)}")
 
-    # B.2 Parse XML
-    try:
-        df_result = phase_b_parse_xml()
-    except Exception as e:
-        print(f"  Parse XML failed: {e}"); traceback.print_exc(); return False
-
-    # Filters
+    # Φίλτρα
     tel_kath_val  = str(df_result["ΤΕΛ_ΚΑΘ"].iloc[0])
     dasmos_kl_val = str(df_result["ΔΑΣΜ_ΚΛ"].iloc[0])
     if tel_kath_val.startswith("71"):
-        print(f"  ΤΕΛ_ΚΑΘ={tel_kath_val} — skipped (transit regime)"); return True
+        log.info(f"  ΤΕΛ_ΚΑΘ={tel_kath_val} — παραλείπεται"); return None, "skip", driver
     if not any(dasmos_kl_val.startswith(p) for p in ALLOWED_DASMOS):
-        print(f"  ΔΑΣΜ_ΚΛ={dasmos_kl_val} — outside allowed commodity codes"); return True
+        log.info(f"  ΔΑΣΜ_ΚΛ={dasmos_kl_val} — εκτός επιτρεπόμενων"); return None, "skip", driver
 
-    # ── Alloy logic for customs office 0832 ─────────────────────────────────────
+    # ── Κράματα (0832) — γεμίζουν ΜΕΣΑ στην ίδια γραμμή, όχι split ──────────
     needs_kramma = any(is_0832_kramma(r) for _, r in df_result.iterrows())
-
     if needs_kramma:
         num_eidi = len(df_result)
-
         if num_eidi == 1:
-            # 1 item → use alloy data from approval popup
             aa = str(df_result.iloc[0]["Α/Α"])
             krammata = {aa: krammata_from_popup}
         else:
-            # 2+ items → show secondary popup
-            print(f"  Office 0832 with {num_eidi} items → ItemsPopup...")
+            log.info(f"  0832 με {num_eidi} είδη → ItemsPopup...")
             items_result = ItemsPopup(df_result, mrn).run()
             if items_result is None:
-                print("  ItemsPopup cancelled."); return False
+                log.error(f"  ItemsPopup ακυρώθηκε ({mrn})."); return None, "fail", driver
             krammata = items_result
 
-        # Expand: split each item into 1-3 rows based on alloy count
-        df_result = expand_krammata(df_result, krammata)
-        print(f"\n  Είδη μετά expand: {len(df_result)}")
+        for i, r in df_result.iterrows():
+            aa = str(r["Α/Α"])
+            d = krammata.get(aa, {})
+            for k in ("ΚΡΑΜΑ_1", "ΒΑΡΟΣ_1", "ΚΡΑΜΑ_2", "ΒΑΡΟΣ_2", "ΚΡΑΜΑ_3", "ΒΑΡΟΣ_3"):
+                df_result.at[i, k] = d.get(k, "")
 
-    print(f"\n{df_result[['Α/Α','ΔΑΣΜ_ΚΛ','ΒΑΡΟΣ','ΚΡΑΜΑ','ΤΙΜΗ','ΦΠΑ']].to_string(index=False)}\n")
+    log.info(f"\n{df_result[['Α/Α','ΔΑΣΜ_ΚΛ','ΒΑΡΟΣ','ΤΙΜΗ','ΦΠΑ']].to_string(index=False)}\n")
 
-    # B.3 PDF rename
-    typos   = str(df_result.iloc[0]["ΤΥΠΟΣ"])
+    # Όλα τα popups ΤΩΡΑ (πριν το SAP) — οι απαντήσεις μένουν στη γραμμή
+    try:
+        for i, r in df_result.iterrows():
+            res = resolve_inputs(r, prot)
+            for k, v in res.items():
+                df_result.loc[i, "_PROT" if k == "PROT" else k] = v
+    except Exception as e:
+        log.exception(f"  Popups ({mrn}): {e}")
+        return None, "fail", driver
+
+    return {"mrn": mrn, "pdf": pdf, "pdf1": pdf1, "df_result": df_result}, "ok", driver
+
+
+def enter_mrn(job: dict, session) -> bool:
+    """
+    Μέρος 2 (μόνο SAP, κανένα popup): PDF rename -> για κάθε Α/Α
+    γέμισμα (με τις τιμές του Μέρους 1) -> Save -> attach -> διπλό F3 ->
+    PDF move μία φορά στο τέλος. Σε σφάλμα: screenshot, close_sap, False.
+    """
+    mrn, pdf, pdf1, df_result = job["mrn"], job["pdf"], job["pdf1"], job["df_result"]
+    log.info(f"\n{'='*60}\n  SAP — MRN : {mrn}\n{'='*60}")
+
+    # Β.3 PDF rename
     dst_pdf = SAP_GUI_DIR / f"{pdf}.pdf"
     if pdf and pdf1:
         src_pdf = SAP_GUI_DIR / f"{pdf1}.pdf"
         if dst_pdf.exists():
-            print(f"  PDF already renamed")
+            log.info(f"  PDF already renamed")
         elif src_pdf.exists():
-            src_pdf.rename(dst_pdf); print(f"  PDF renamed: {pdf1} -> {pdf}")
+            src_pdf.rename(dst_pdf); log.info(f"  PDF renamed: {pdf1} -> {pdf}")
         else:
-            print(f"  PDF not found: {src_pdf}"); return False
+            log.warning(f"  PDF not found: {src_pdf}"); dst_pdf = None
+    elif not pdf:
+        log.warning("  Δεν βρέθηκε PDF filename — παραλείπεται το attach.")
+        dst_pdf = None
 
-    # B.4 SAP entry loop — one iteration per declaration line
-    last_ea = ""
-    try:
-        for idx, (_, row_item) in enumerate(df_result.iterrows()):
-            print(f"\n  Καταχώρηση {idx+1}/{len(df_result)} | Α/Α={row_item['Α/Α']} | ΚΡΑΜΑ={row_item['ΚΡΑΜΑ']} | ΒΑΡΟΣ={row_item['ΒΑΡΟΣ']}")
-            if idx > 0 and not str(row_item.get("ΕΝΤ_ΑΓ", "")).strip():
-                df_result.at[row_item.name, "ΕΝΤ_ΑΓ"] = last_ea
-            sap_entry(df_result.loc[row_item.name], prot, sap_running=False)
-            last_ea = str(df_result.at[row_item.name, "ΕΝΤ_ΑΓ"]).strip()
-            sap_attach(mrn, typos)
-
-            # Wait for successful attachment confirmation
-            print("  Waiting for save...")
-            while True:
-                try:
-                    app = Application(backend="uia").connect(
-                        class_name="SAP_FRONTEND_SESSION", timeout=5)
-                    app.window(class_name="SAP_FRONTEND_SESSION") \
-                        .child_window(auto_id="59393") \
-                        .wait("exists", timeout=5)
-                    print("  Attachment OK")
-                    break
-                except:
-                    time.sleep(1)
-
-            # Close ZGOS attachment window
-            while True:
-                try:
-                    get_sap_win().child_window(
-                        class_name="DialogBox Container Class",
-                        title_re="ZGOS_ZIMP1.*"
-                    ).wait("exists", timeout=5).close()
-                    break
-                except:
-                    break
-
-            time.sleep(2)
-
-    except Exception as e:
-        print(f"  SAP entry failed: {e}"); traceback.print_exc()
-        close_sap(); return False
-
-    close_sap(); time.sleep(2)
-
-    # B.5 Archive PDF
-    kath        = int(df_result.iloc[0]["ΚΑΘ"])
-    dest_subdir = KATH_DIR.get(kath)
-    if dest_subdir and dst_pdf.exists():
-        dest = ATLAS_BASE / dest_subdir / f"{pdf}.pdf"
+    # Β.4 SAP loop — κάθε γραμμή (Α/Α) = 1 ξεχωριστή καταχώρηση, ΧΩΡΙΣ Save.
+    # Το session μένει ανοιχτό/logged-in σε όλο το batch (ΔΕΝ κλείνει ανά
+    # καταχώρηση) — μεταξύ καταχωρήσεων γυρνάμε πίσω με διπλό F3.
+    total = len(df_result)
+    for idx, (i, row_item) in enumerate(df_result.iterrows(), 1):
+        log.info(f"\n  Καταχώρηση {idx}/{total} | Α/Α={row_item['Α/Α']}")
+        t_step = perf_counter()
         try:
-            shutil.move(str(dst_pdf), str(dest))
-            print(f"  PDF moved -> {dest_subdir}")
+            # Το XML/data είναι ήδη έτοιμα (Β.1/Β.2 παραπάνω) — η πλοήγηση SAP
+            # (Επιλογή Πεδίου κλπ) γίνεται ΤΩΡΑ, ακριβώς πριν χρειαστεί.
+            sap_ima_reenter_transaction(session)
+            sap_ima_open_new_entry(session)
+            ima_row = df_result.loc[i]
+            sap_entry(session, ima_row, str(ima_row["_PROT"]))
         except Exception as e:
-            print(f"  Move failed: {e}")
-    elif not dest_subdir:
-        print(f"  Unknown customs regime KAΘ={kath}")
+            log.exception(f"  SAP entry ΣΦΑΛΜΑ (Α/Α={row_item['Α/Α']}): {e}")
+            save_screenshot(f"{mrn}_{idx:02d}_ERROR")
+            close_sap(); return False
+        log.info(f"  [χρόνος] SAP Entry: {fmt_duration(perf_counter() - t_step)}")
 
+        t_step = perf_counter()
+        session.findById("wnd[0]/tbar[0]/btn[11]").press()
+        status_text = ""
+        for _ in range(20):
+            status_text = session.findById("wnd[0]/sbar/pane[0]").text
+            if "Δεδομένα αποθηκεύτηκαν" in status_text:
+                break
+            time.sleep(0.5)
+        else:
+            log.exception(f"  Δεν επιβεβαιώθηκε το Save. Status bar: '{status_text}'")
+            save_screenshot(f"{mrn}_{idx:02d}_SAVE_NOT_CONFIRMED")
+            close_sap(); return False
+        _SAVED["n"] += 1
+        log.info(f"  Save επιβεβαιώθηκε (Α/Α={row_item['Α/Α']}): {status_text}  |  "
+                 f"[χρόνος] Save: {fmt_duration(perf_counter() - t_step)}")
+
+        t_step = perf_counter()
+        try:
+            if dst_pdf and dst_pdf.exists():
+                sap_attach(session, dst_pdf)
+        except Exception as e:
+            log.exception(f"  Attach ΣΦΑΛΜΑ (Α/Α={row_item['Α/Α']}): {e}")
+            save_screenshot(f"{mrn}_{idx:02d}_ATTACH_ERROR")
+            close_sap(); return False
+        log.info(f"  [χρόνος] Attach: {fmt_duration(perf_counter() - t_step)}")
+
+        sap_ima_back_to_overview(session)
+        # Η επόμενη επανάληψη (ή το επόμενο MRN) θα κάνει sap_ima_reenter_transaction()
+        # ΜΕΤΑ που θα είναι έτοιμο το δικό της XML — όχι τώρα.
+
+    # Β.5 PDF Move — ΜΙΑ φορά για ΟΛΗ τη δήλωση, ΜΕΤΑ από ΟΛΑ τα Α/Α (ίδιο
+    # pattern με το ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ NEW — ποτέ Move ενδιάμεσα, γιατί όλα τα
+    # Α/Α μοιράζονται το ίδιο PDF).
+    if dst_pdf and dst_pdf.exists():
+        first_row = df_result.iloc[0]
+        kath = compute_kath(str(first_row["X16"]), str(first_row["ΤΕΛ_ΚΑΘ"]))
+        dest_subdir = KATH_DIR.get(kath)
+        if dest_subdir:
+            dest = ARCHIVE_BASE / dest_subdir / dst_pdf.name
+            if dest.exists():
+                log.info(f"  PDF ήδη υπάρχει στο network folder — δεν το αγγίζω: {dest}")
+            else:
+                try:
+                    shutil.move(str(dst_pdf), str(dest))
+                    log.info(f"  PDF moved -> {dest}")
+                except Exception as e:
+                    log.exception(f"  Move failed: {e}")
+        else:
+            log.warning(f"  Άγνωστο ΚΑΘ={kath} — δεν έγινε Move.")
+
+    log.info("  Ολοκληρώθηκαν όλες οι καταχωρήσεις του MRN — ΜΕ Save, ΜΕ PDF Move.")
     return True
 
 # ==============================================================================
@@ -1764,8 +2011,8 @@ def read_icisnet_from_pdf() -> pd.DataFrame:
         return pd.DataFrame(columns=["MRN","ΤΥΠΟΣ","ΚΑΤΑΣΤΑΣΗ","LRN","ΗΜ_ΥΠΟΒ","ΗΜ_ΕΝΗΜ","PDF"])
 
     repl = [
-        ("YOUR_LRN_PREFIX_ALT/", "YOUR_LRN_PREFIX/"), ("ELVELV", "ELV"),
-        ("YOUR_VAT_PREFIX_WRONG", "YOUR_VAT_PREFIX_CORRECT"),
+        ("YOUR_BROKER_ID/25/", "ELVYOUR_BROKER_ID/25/"), ("ELVELV", "ELV"),
+        ("YOUR_BROKER_ID2/26/131ELB", "YOUR_BROKER_ID2/26/131ELV"),
     ]
     df["LRN"] = df["LRN"].astype(str)
     for old, new in repl:
@@ -1777,11 +2024,16 @@ def read_icisnet_from_pdf() -> pd.DataFrame:
     df["ΗΜ_ΕΝΗΜ"] = pd.NaT
     df["PDF"] = df["MRN"].astype(str) + " " + df["Τύπος Δήλωσης"].astype(str)
     df = df.rename(columns={"Τύπος Δήλωσης": "ΤΥΠΟΣ"})
-    df = df[~df["LRN"].str.contains("EXCLUDED_LRN_PREFIX", na=False)]
+    df = df[~df["LRN"].str.contains("XALELV", na=False)]
     df = df[df["LRN"].str.contains(r"ELV|ΕLV", na=False)]
     df = df[df["MRN"] != ""]
 
     return df[["MRN","ΤΥΠΟΣ","ΚΑΤΑΣΤΑΣΗ","LRN","ΗΜ_ΥΠΟΒ","ΗΜ_ΕΝΗΜ","PDF"]].reset_index(drop=True)
+
+
+def fmt_duration(seconds: float) -> str:
+    m, s = divmod(int(round(seconds)), 60)
+    return f"{m}λ {s}δευτ" if m else f"{s}δευτ"
 
 
 def main():
@@ -1793,7 +2045,7 @@ def main():
         return
 
     if mode == 1:
-        print("\n── PHASE A: IMPORT DECLARATIONS ──")
+        print("\n── ΦΑΣΗ Α: ΕΙΣΑΓΩΓΕΣ ──")
         print("\n[1/3] ICISnet scraping...")
         df_final = phase_a_icisnet()
         print("\n[2/3] SAP Export...")
@@ -1802,23 +2054,23 @@ def main():
         df_opened = phase_a_queries(df_final)
 
     elif mode == 2:
-        print("\n[Queries] from saved PDF...")
+        print("\n[Queries] από αποθηκευμένο PDF...")
         df_final = read_icisnet_from_pdf()
-        print(f"  PDF: {len(df_final)} records")
+        print(f"  PDF: {len(df_final)} εγγραφές")
         df_opened = phase_a_queries(df_final)
 
     else:
-        print("\n── Loading FULL_RESULTS.xlsx ──")
+        print("\n── Φόρτωση FULL_RESULTS.xlsx ──")
         df_opened = pd.read_excel(OUTPUT_EXCEL, sheet_name="opened")
         df_opened.columns = df_opened.columns.str.strip()
 
     if df_opened.empty:
-        show_info("⚠️  No declarations pending for entry.")
+        show_info("⚠️  Δεν υπάρχουν διασαφίσεις προς καταχώρηση.")
         return
 
 
     # ── POPUP ─────────────────────────────────────────────────────────────────
-    print("\n── POPUP: Waiting for user ──")
+    print("\n── POPUP: Αναμονή χρήστη ──")
 
     rows = []
     for _, r in df_opened.iterrows():
@@ -1838,62 +2090,92 @@ def main():
     selected = ApprovalPopup(rows).run()
 
     if selected is None:
-        print("  Cancelled.")
+        print("  Ακυρώθηκε.")
         return
 
-    print(f"  {len(selected)} MRNs selected — starting Phase B...")
-
-    # Άνοιγμα browser και login μία φορά
-    print("  Opening browser and logging into ICISnet...")
-    driver = make_chrome(download_folder=SAVE_FOLDER)
-    wait = WebDriverWait(driver, 45)
-    driver.get("https://www1.gsis.gr/icisnet/itrader/common/home.jsf")
-    wait.until(EC.presence_of_element_located((By.NAME, "username"))).send_keys(ICISNET_USER)
-    driver.find_element(By.NAME, "password").send_keys(ICISNET_PASS)
-    driver.find_element(By.NAME, "btn_login").click()
-    time.sleep(3)
-    print("  ICISnet login OK!")
-
-    # ── ΦΑΣΗ Β ───────────────────────────────────────────────────────────────
-    print("\n── PHASE B: SAP Entries ──")
+    print(f"  {len(selected)} MRNs επιλέχθηκαν — εκκίνηση Φάσης Β...")
 
     df_excel = pd.read_excel(OUTPUT_EXCEL, sheet_name="opened")
     if "Status" not in df_excel.columns:
         df_excel["Status"] = ""
 
-    ok_n = 0; fail_n = 0
+    def mark_done(mrn):
+        try:
+            df_excel.loc[df_excel["MRN"].astype(str) == str(mrn), "Status"] = "DONE"
+            with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl",
+                                mode="a", if_sheet_exists="replace") as w:
+                df_excel.to_excel(w, sheet_name="opened", index=False)
+            print(f"  Status -> DONE")
+        except Exception as e:
+            print(f"  Status update failed: {e}")
 
+    ok_n = 0; fail_n = 0; skip_n = 0
+
+    # ── ΦΑΣΗ Β.1: XML + popups για ΟΛΑ τα MRN (το SAP είναι κλειστό) ────────
+    # Ο browser ανοίγει μόνο αν χρειαστεί λήψη (phase_b_download_xml κάνει
+    # login όταν το driver δεν είναι ζωντανό). Σφάλμα σε ένα MRN εδώ δεν
+    # σταματάει τα υπόλοιπα — δεν έχει αγγιχτεί ακόμα το SAP.
+    print("\n── ΦΑΣΗ Β.1: XML + popups ──")
+    driver = None
+    jobs = []
     for i, row in enumerate(selected, 1):
         mrn = row.get("MRN", "???")
         print(f"\n[{i}/{len(selected)}] {mrn}")
-
-        success = process_mrn(row, driver)
-
-        if success:
-            ok_n += 1
-            try:
-                df_excel.loc[df_excel["MRN"].astype(str) == str(mrn), "Status"] = "DONE"
-                with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl",
-                                    mode="a", if_sheet_exists="replace") as w:
-                    df_excel.to_excel(w, sheet_name="opened", index=False)
-                print(f"  Status -> DONE")
-            except Exception as e:
-                print(f"  Status update failed: {e}")
+        job, status, driver = prepare_mrn(row, driver)
+        if status == "ok":
+            jobs.append(job)
+        elif status == "skip":
+            skip_n += 1
+            mark_done(mrn)
         else:
             fail_n += 1
-            print(f"  FAIL — continuing to next...")
+            log.error(f"  FAIL (XML/popups) στο MRN={mrn} — δεν θα περαστεί στο SAP.")
+    if driver is not None:
+        try:
+            driver.quit()
+            print("  Browser closed")
+        except Exception:
+            pass
 
-    try:
-        driver.quit()
-        print("  Browser closed")
-    except:
-        pass
+    # ── ΦΑΣΗ Β.2: SAP — ένα login, όλες οι καταχωρήσεις, κανένα popup ───────
+    if jobs:
+        print(f"\n── ΦΑΣΗ Β.2: SAP καταχωρήσεις ({len(jobs)} MRN) ──")
+        print("  SAP login (μία φορά για όλο το batch)...")
+        session = sap_ima_login()
+        for i, job in enumerate(jobs, 1):
+            print(f"\n[{i}/{len(jobs)}] {job['mrn']}")
+            if enter_mrn(job, session):
+                ok_n += 1
+                mark_done(job["mrn"])
+            else:
+                fail_n += 1
+                # enter_mrn() έχει ήδη κάνει close_sap() — με νεκρό session το
+                # επόμενο MRN θα έσκαγε κι αυτό (confirmed live 2026-10-01).
+                log.error(f"  FAIL στο MRN={job['mrn']} — σταματάω το batch (το SAP session έκλεισε ήδη).")
+                break
+        close_sap()
+        print("  SAP closed")
+    else:
+        print("\n  Κανένα MRN για SAP.")
 
     elapsed = perf_counter() - T0
+    total_n = ok_n + fail_n
+    avg = elapsed / total_n if total_n else 0
     print(f"\n{'='*60}")
-    print(f"  ΟΛΟΚΛΗΡΩΘΗΚΕ  |  OK:{ok_n}  FAIL:{fail_n}  |  {elapsed/60:.1f} λεπτά")
+    print(f"  ΟΛΟΚΛΗΡΩΘΗΚΕ  |  OK:{ok_n}  FAIL:{fail_n}  ΠΑΡΑΛΕΙΨΗ:{skip_n}  |  "
+          f"Σύνολο: {fmt_duration(elapsed)}  |  AVG: {fmt_duration(avg)}/MRN")
     print(f"{'='*60}")
 
 
 if __name__ == "__main__":
-    main()
+    mutex = win32event.CreateMutex(None, False, SAP_MUTEX_NAME)
+    print("Αναμονή SAP mutex (αν τρέχει άλλο script στο SAP)...")
+    win32event.WaitForSingleObject(mutex, win32event.INFINITE)
+    try:
+        main()
+    except Exception as e:
+        log.exception(f"ΣΦΑΛΜΑ: {e}")
+        raise
+    finally:
+        win32event.ReleaseMutex(mutex)
+        _finish_log()
