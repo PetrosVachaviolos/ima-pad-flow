@@ -118,3 +118,7 @@ Key differences from the Python version:
 **Python implementation:** Python, Selenium, SAP GUI Scripting (win32com), pandas, openpyxl, tkinter, pdfplumber, keyring
 
 **PAD implementation:** Power Automate Desktop, Power Query M, SAP GUI, Web Automation (Chrome)
+
+## License
+
+Copyright (c) 2026 Petros Vachaviolos. All rights reserved. Proprietary; shown here as a portfolio. No use, copying or redistribution without the author's written permission. See [LICENSE.txt](LICENSE.txt).

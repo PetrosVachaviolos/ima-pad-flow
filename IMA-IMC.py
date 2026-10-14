@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Petros Vachaviolos. All rights reserved.
+# Written by Petros Vachaviolos (sole author), for personal use only. No use or exploitation without
+# the author's written permission, also after any employment ends. See LICENSE.txt.
 # ==============================================================================
 # main.py — Orchestrator (ΠΛΗΡΗΣ ΡΟΕΣ)
 # ==============================================================================
