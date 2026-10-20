@@ -81,6 +81,14 @@ main()
 
 **Three startup modes.** Mode 1 runs the full pipeline. Mode 2 reads a previously saved ICISNET PDF (avoids re-scraping). Mode 3 loads an existing FULL_RESULTS.xlsx directly — useful when resuming after a partial run.
 
+**Explicit tax mapping.** Duty and VAT are read from the XML by tax type code (`101` duty, `301` VAT), not by "smallest rate = duty" as in the original Power Query. A line without a duty entry is flagged `ΧΩΡΙΣ_ΔΑΣΜΟ` instead of relying on a magic rate value; unknown tax codes are logged, never guessed.
+
+**Purchase order from the declaration.** The PO number is taken from the XML document references. If it is missing, the operator types five digits and the script adds the prefix: `41000…` for normal imports, `44000…` for re-imports (procedure 6121). Re-imports carry the PO even when no duty is due. The SAP field accepts exactly 10 characters, so anything else is sent back for correction.
+
+**Inward-processing references (INF).** For procedure 12 the INF numbers from the XML are packed into the four 20-character invoice fields, choosing the most readable format that fits the count (full references for a few, shortened ranges for many) — the same convention operators used by hand.
+
+**Guarantee switch by date.** Guarantee references changed on a fixed date; the script picks old or new based on the declaration date, so late postings of older declarations stay correct.
+
 **Operational safety.**
 - Credentials come from the Windows Credential Manager (`keyring`), never from the code.
 - A system-wide mutex prevents two SAP automations from running at the same time.

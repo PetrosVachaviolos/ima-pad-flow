@@ -26,6 +26,7 @@
 # ==============================================================================
 
 import os
+import re
 import sys
 import io
 import ssl
@@ -351,7 +352,7 @@ def sap_ima_open_new_entry(session):
 def sap_ima_back_to_overview(session):
     """Διπλό F3 (Πίσω) — γυρνάει ΠΙΣΩ ΜΕΧΡΙ ΤΟ ΣΗΜΕΙΟ ΠΟΥ ΘΑ ΞΑΝΑΓΡΑΨΟΥΜΕ
     ZELVMM_IMP_1 (επιβεβαιώθηκε από τον χρήστη) — ίδιο pattern "διπλό F3"
-    με το attach_pdf_gos() του ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ NEW. Μετά από αυτό πρέπει
+    με το attach_pdf_gos() του script ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ. Μετά από αυτό πρέπει
     να καλείται sap_ima_reenter_transaction(), όχι απευθείας
     sap_ima_open_new_entry()."""
     session.findById("wnd[0]/tbar[0]/btn[3]").press(); time.sleep(1)
@@ -477,14 +478,14 @@ def phase_a_icisnet() -> pd.DataFrame:
             Select(driver.find_element(By.ID, "contentForm:search_scope")).select_by_value("Trader")
 
             t_search = perf_counter()
-            for sa in range(1, 11):
+            for sa in range(1, 21):                         # 20 × (15″ + 1″) ≈ 5 λεπτά
                 try:
                     driver.find_element(By.XPATH, "//input[@value='Αναζήτηση']").click()
                     WebDriverWait(driver, 15).until(
                         EC.element_to_be_clickable((By.ID, "contentForm:printResultsReport")))
                     break
                 except:
-                    if sa == 10: raise
+                    if sa == 20: raise
                     time.sleep(1)
             print(f"    [χρόνος] Αναζήτηση -> αποτελέσματα έτοιμα: {fmt_duration(perf_counter() - t_search)}")
 
@@ -1318,6 +1319,9 @@ def phase_b_download_xml(mrn: str, driver):
 # ΦΑΣΗ Β.2 — Parse XML
 # ==============================================================================
 
+TAX_DUTY, TAX_VAT = "101", "301"          # TypOfTaxCTX1 στο ID29 XML
+
+
 def phase_b_parse_xml(xml_path: Path) -> pd.DataFrame:
     import xml.etree.ElementTree as ET
     tree = ET.parse(xml_path); root = tree.getroot()
@@ -1391,19 +1395,29 @@ def phase_b_parse_xml(xml_path: Path) -> pd.DataFrame:
         for doc in item.findall("PRODOCDC2"):
             di = doc.findtext("DocInfDC1008", "")
             if di: ent_ag = di.replace("/", "000").replace("-", "000"); break
+        infs = [d.findtext("DocRefDC23", "") for d in item.findall("PRODOCDC2")
+                if d.findtext("DocTypDC21", "") == "C710"]          # INF, με τη σειρά του XML
 
         comcod    = item.find("COMCODGODITM")
         dasmos_kl = comcod.findtext("ComNomCMD1", "") if comcod is not None else ""
 
-        taxes = [(float(t.findtext("RatOfTaxCTX1", "0")),
-                  float(t.findtext("AmoOfTaxTCL1", "0")))
-                 for t in item.findall("CALTAXGOD")]
-        if taxes:
-            rates = [t[0] for t in taxes]; amos = [t[1] for t in taxes]
-            sd = min(rates); da = min(amos); sf = max(rates); fa = max(amos)
-            df_val = None if da == fa else da; sf_fin = sf if sf else 24.0
-        else:
-            sd = da = fa = None; df_val = None; sf_fin = 24.0
+        # Φόροι ανά κωδικό (TypOfTaxCTX1) — ρητό mapping, όχι min/max όπως το παλιό Power Query:
+        # 101 = δασμός -> ΣΥΝΤ_ΔΑΣΜ / ΔΑΣΜ, 301 = ΦΠΑ -> ΣΥΝΤ_ΦΠΑ / ΦΠΑ. Χωρίς γραμμή 101 -> ΧΩΡΙΣ_ΔΑΣΜΟ = ΝΑΙ.
+        by_code = {}
+        for t in item.findall("CALTAXGOD"):
+            code = (t.findtext("TypOfTaxCTX1", "") or "").strip()
+            rate = float(t.findtext("RatOfTaxCTX1", "0") or 0)
+            amo = float(t.findtext("AmoOfTaxTCL1", "0") or 0)
+            r0, a0 = by_code.get(code, (rate, 0.0))
+            by_code[code] = (r0, a0 + amo)
+        unknown = sorted(set(by_code) - {TAX_DUTY, TAX_VAT})
+        if unknown:
+            log.warning(f"  ⚠ {mrn} Α/Α {aa}: άγνωστος κωδικός φόρου {unknown} {[by_code[c] for c in unknown]}"
+                        f" — δεν μπαίνει σε κανένα πεδίο, έλεγξέ τον")
+        sd, df_val = by_code.get(TAX_DUTY, (None, None))
+        sf, fa = by_code.get(TAX_VAT, (None, None))
+        sf_fin = sf if sf else 24.0
+        no_duty = "ΝΑΙ" if by_code and TAX_DUTY not in by_code else ""
 
         rows.append({
             "ΤΕΛΩΝ": telwneio, "ΤΥΠΟΣ": typos, "MRN": mrn, "ΗΜΕΡ": fmt(dec_date),
@@ -1416,22 +1430,22 @@ def phase_b_parse_xml(xml_path: Path) -> pd.DataFrame:
             "ΤΙΜΗ": f"{float(pro_pri):.2f}".replace(".", ",") if pro_pri else "",
             "ΝΟΜ_ΙΣΟΤ": nom_isot, "ΙΣΟΤ": to_comma_rate(isot),
             "ΣΥΝΤ_ΔΑΣΜ": to_comma(sd), "ΔΑΣΜ": to_comma(df_val),
-            "ΣΥΝΤ_ΦΠΑ": to_comma(sf_fin), "ΦΠΑ": to_comma(fa),
-            "ΕΝΤ_ΑΓ": ent_ag, "ΗΜΕΡ_ΠΡΟΘ": fmt(hp),
+            "ΣΥΝΤ_ΦΠΑ": to_comma(sf_fin), "ΦΠΑ": to_comma(fa), "ΧΩΡΙΣ_ΔΑΣΜΟ": no_duty,
+            "ΕΝΤ_ΑΓ": ent_ag, "ΗΜΕΡ_ΠΡΟΘ": fmt(hp), "INF": "|".join(infs),
         })
 
     cols = ["ΤΕΛΩΝ","ΤΥΠΟΣ","MRN","ΗΜΕΡ","ΔΑΣΜ_ΚΛ","Α/Α","ΧΩΡΑ","ΚΡΑΜΑ","ΚΑΘ","ΤΕΛ_ΚΑΘ",
             "ΗΜΕΡ_ΛΗΞΗΣ","ΗΜΕΡ_ΛΗΞΗΣ2","ΒΑΡΟΣ","X16","ΝΟΜ_ΣΤΑΤ","ΣΤΑΤ_ΑΞΙΑ","ΠΡΟΜ","ΟΡΟΙ",
-            "ΤΙΜΗ","ΝΟΜ_ΙΣΟΤ","ΙΣΟΤ","ΣΥΝΤ_ΔΑΣΜ","ΔΑΣΜ","ΣΥΝΤ_ΦΠΑ","ΦΠΑ","ΕΝΤ_ΑΓ","ΗΜΕΡ_ΠΡΟΘ"]
+            "ΤΙΜΗ","ΝΟΜ_ΙΣΟΤ","ΙΣΟΤ","ΣΥΝΤ_ΔΑΣΜ","ΔΑΣΜ","ΣΥΝΤ_ΦΠΑ","ΦΠΑ","ΧΩΡΙΣ_ΔΑΣΜΟ","ΕΝΤ_ΑΓ","ΗΜΕΡ_ΠΡΟΘ","INF"]
     return pd.DataFrame(rows)[cols]
 
 # ==============================================================================
 # ΦΑΣΗ Β.3 — SAP entry
 # ==============================================================================
 
-def get_kramma(dasmos_kl: str, synt_dasm: str):
+def get_kramma(dasmos_kl: str, no_duty: bool):
     if dasmos_kl.startswith("760200"):
-        return "SCRAP-ΦΥΡΑ" if synt_dasm == "24" else "SCRAP"
+        return "SCRAP-ΦΥΡΑ" if no_duty else "SCRAP"
     m = {
         "76011090": "1XXX", "76012080": "AL", "76012030": "AL", "76011010": "AL",
         "81041100": "MG",   "81110011": "MN",
@@ -1466,6 +1480,66 @@ def get_sap_win(timeout=10):
 ZIMP_BASE = "/app/con[0]/ses[0]/wnd[0]/usr/"
 
 
+# GRN εγγυήσεων (mail συναδέλφου 16/10/2026): από 19/10/2026 νέα GRN. Επιλογή με την ημερομηνία της
+# διασάφησης (ΗΜΕΡ = DecDatHEA383), ώστε διασαφήσεις πριν τις 19/10 να κρατούν το παλιό GRN.
+GRN_SWITCH_DATE = datetime(2026, 10, 19).date()
+GRN_ENERG = ("YOUR_GRN_ENERG_OLD", "YOUR_GRN_ENERG_NEW")   # ΚΑΘ 2 — τελειοποίηση (51), YOUR_CGU / YOUR_SASP_1
+GRN_IMC   = ("YOUR_GRN_IMC_OLD", "YOUR_GRN_IMC_NEW")   # ΚΑΘ 3/5 IM-C (40), YOUR_SASP_2
+
+
+# ΚΑΘ 12 (INF): τα INF (C710 του XML) στα ΤΙΜΟΛΟΓΙΟ 1–4 (20 χαρακτήρες το καθένα) — η πιο ευανάγνωστη
+# μορφή που τα χωράει όλα, όπως τα γράφαμε με το χέρι (ίδια λογική με το ΕΛΕΓΧΟΣ INF.py):
+#   1–4 EX/IM000290 INF | 5–8 EX/IM000275/278 INF | 9–12 EX/IM217/219/220 INF
+#   13–16 EX/IM188/209/231/249 | 17–20 217/219/220/227/228 | >20 όσα χωράνε + μήνυμα
+INV_FIELDS, INV_MAXLEN = ("ctxtZIMP_1-VBELN", "txtZIMP_1-VBELN_2", "txtZIMP_1-VBELN_3", "txtZIMP_1-VBELN_4"), 20
+INF_STYLES = [
+    lambda g: f"EX/IM{g[0][0]}" + "".join(f"/{n}" for _, n in g[1:]) + " INF",
+    lambda g: "EX/IM" + "/".join(n for _, n in g) + " INF",
+    lambda g: "EX/IM" + "/".join(n for _, n in g),
+    lambda g: "/".join(n for _, n in g),
+]
+
+
+def _inf_greedy(refs, render):
+    fields, group = [], []
+    for i, r in enumerate(refs):
+        if not group or len(render(group + [r])) <= INV_MAXLEN:
+            group.append(r)
+            continue
+        fields.append(render(group))
+        if len(fields) == len(INV_FIELDS):
+            return fields, refs[i:]
+        group = [r]
+    if group:
+        fields.append(render(group))
+    return fields, []
+
+
+def pack_inf(inf_text: str):
+    """'EX/IM000217|EX/IM000219|…' -> (λίστα έως 4 πεδίων, INF που δεν χώρεσαν)."""
+    refs = []
+    for ref in [x for x in str(inf_text or "").split("|") if x and x.lower() != "nan"]:
+        digits = re.findall(r"\d+", ref)
+        full = digits[-1] if digits else ref
+        refs.append((full, full.lstrip("0") or "0"))
+    if not refs:
+        return [], []
+    if len(refs) <= len(INV_FIELDS):
+        return [f"EX/IM{full} INF" for full, _ in refs], []
+    for render in INF_STYLES:
+        fields, left = _inf_greedy(refs, render)
+        if not left:
+            return fields, []
+    fields, left = _inf_greedy(refs, INF_STYLES[-1])
+    return fields, [n for _, n in left]
+
+
+def pick_grn(pair, decl_date: str) -> str:
+    """decl_date 'dd.mm.yyyy' -> παλιό GRN πριν τις 19/10/2026, νέο από τότε."""
+    d = datetime.strptime(decl_date, "%d.%m.%Y").date()
+    return pair[1] if d >= GRN_SWITCH_DATE else pair[0]
+
+
 def sap_entry(session, row, prot: str):
     """
     SAP GUI Scripting έκδοση — γεμίζει όλα τα πεδία της οθόνης "Νέες
@@ -1489,6 +1563,7 @@ def sap_entry(session, row, prot: str):
     pr  = str(row["ΠΡΟΜ"]);   or_ = str(row["ΟΡΟΙ"]); ti = str(row["ΤΙΜΗ"])
     ni  = str(row["ΝΟΜ_ΙΣΟΤ"]); is_ = str(row["ΙΣΟΤ"]); sd = str(row["ΣΥΝΤ_ΔΑΣΜ"])
     da  = str(row["ΔΑΣΜ"]);   sf  = str(row["ΣΥΝΤ_ΦΠΑ"]); fp = str(row["ΦΠΑ"])
+    nd = str(row.get("ΧΩΡΙΣ_ΔΑΣΜΟ", "")).strip() == "ΝΑΙ"     # χωρίς γραμμή δασμού (101) στο XML
     ea  = str(row["ΕΝΤ_ΑΓ"]).strip(); ip = str(row["ΗΜΕΡ_ΠΡΟΘ"])
 
     kath = compute_kath(x16, tk_)
@@ -1513,6 +1588,7 @@ def resolve_inputs(row, prot: str) -> dict:
     στη γραμμή — στο Μέρος 2 βρίσκει τις τιμές συμπληρωμένες και δεν ρωτάει ξανά."""
     mn = str(row["MRN"]); dk = str(row["ΔΑΣΜ_ΚΛ"]); aa = str(row["Α/Α"])
     sd = str(row["ΣΥΝΤ_ΔΑΣΜ"]); ea = str(row["ΕΝΤ_ΑΓ"]).strip()
+    nd = str(row.get("ΧΩΡΙΣ_ΔΑΣΜΟ", "")).strip() == "ΝΑΙ"     # χωρίς γραμμή δασμού (101) στο XML
 
     # ── ΚΡΑΜΑΤΑ: έως 3 ζεύγη ΚΡΑΜΑ/ΒΑΡΟΣ σε ΜΙΑ καταχώρηση ──────────────
     # Αν το row έχει ήδη ΚΡΑΜΑ_1/ΒΑΡΟΣ_1 (από το popup για 0832, βλ.
@@ -1535,7 +1611,7 @@ def resolve_inputs(row, prot: str) -> dict:
         elif is_0832_kramma(row):
             kr1 = popup_input("ΚΡΑΜΑ", f"ΤΕΛΩΝ=0832 | {dk}\nΕισάγετε ΚΡΑΜΑ (1ο):")
         else:
-            kr1 = get_kramma(dk, sd)
+            kr1 = get_kramma(dk, nd)
             if kr1 is None:
                 kr1 = popup_input("ΚΡΑΜΑ", f"Εισάγετε ΚΡΑΜΑ για {dk}:")
         # ΒΑΡΟΣ_1 μένει κενό (όπως ο παλιός κώδικας) όταν υπάρχει μόνο ένα
@@ -1547,16 +1623,20 @@ def resolve_inputs(row, prot: str) -> dict:
         prot = popup_input("ΠΡΟΤΙΜΗΣΗ", f"MRN:{mn}|Α/Α:{aa}\nΕισάγετε ΠΡΟΤΙΜΗΣΗ:")
         if not prot: raise ValueError("ΠΡΟΤΙΜΗΣΗ κενή")
 
-    if sd != "24" and ea in ("", "nan", "None"):
-        raw = popup_input("ΕΝΤΟΛΗ ΑΓΟΡΑΣ", f"MRN:{mn}\n5 ψηφία ΕΝΤ_ΑΓ (ή NO):")
+    # 6121 = επανεισαγωγή (π.χ. SUPPLIER_X): ΕΝΤΟΛΗ ΑΓΟΡΑΣ 44000xxxxx (N935 στο XML) — μπαίνει ΠΑΝΤΑ, και χωρίς δασμό
+    is_6121 = str(row.get("ΤΕΛ_ΚΑΘ", "")).strip() == "6121"
+    need_ea = not nd or is_6121
+    if need_ea and ea in ("", "nan", "None"):
+        pre = "44000" if is_6121 else "41000"          # όλες οι άλλες 41000xxxxx
+        raw = popup_input("ΕΝΤΟΛΗ ΑΓΟΡΑΣ", f"MRN:{mn}\n5 ψηφία ΕΝΤ_ΑΓ — μπαίνει μπροστά {pre} (ή NO):")
         if raw:
-            ea = "NO" if raw.upper() == "NO" else f"41000{raw.strip()}"
+            ea = "NO" if raw.upper() == "NO" else f"{pre}{raw.strip()}"
 
     # Το πεδίο EBELN στο SAP δέχεται ΑΚΡΙΒΩΣ 10 χαρακτήρες — οτιδήποτε άλλο
     # σκάει στο session.findById(...).text = ea με "Property can not be set"
     # (confirmed live 2026-10-01, MRN YOUR_MRN_6: ea είχε 13 χαρακτήρες
     # αντί για 10). Αντί να σκάσει, ζητάμε διόρθωση από τον χρήστη.
-    while sd != "24" and ea.upper() != "NO" and len(ea) != 10:
+    while need_ea and ea.upper() != "NO" and len(ea) != 10:
         raw = popup_input(
             "ΕΝΤΟΛΗ ΑΓΟΡΑΣ — ΛΑΘΟΣ ΜΗΚΟΣ",
             f"MRN:{mn}\nΗ τιμή '{ea}' έχει {len(ea)} χαρακτήρες (πρέπει ΑΚΡΙΒΩΣ 10).\n"
@@ -1581,6 +1661,7 @@ def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot,
     pr  = str(row["ΠΡΟΜ"]);   or_ = str(row["ΟΡΟΙ"]); ti = str(row["ΤΙΜΗ"])
     ni  = str(row["ΝΟΜ_ΙΣΟΤ"]); is_ = str(row["ΙΣΟΤ"]); sd = str(row["ΣΥΝΤ_ΔΑΣΜ"])
     da  = str(row["ΔΑΣΜ"]);   sf  = str(row["ΣΥΝΤ_ΦΠΑ"]); fp = str(row["ΦΠΑ"])
+    nd = str(row.get("ΧΩΡΙΣ_ΔΑΣΜΟ", "")).strip() == "ΝΑΙ"     # χωρίς γραμμή δασμού (101) στο XML
     ip  = str(row["ΗΜΕΡ_ΠΡΟΘ"])
 
     # ── Βασικά πεδία κεφαλίδας ────────────────────────────────────────────
@@ -1601,11 +1682,20 @@ def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot,
     session.findById(B + "ctxtZIMP_1-Z_IMP").text = str(kath)
     session.findById(B + "txtZIMP_1-Z_IMP_TEL").text = tk_
 
+    if kath == 12:                                  # INF -> ΤΙΜΟΛΟΓΙΟ 1–4
+        inf_fields, inf_left = pack_inf(row.get("INF", "") if hasattr(row, "get") else "")
+        for fid, val in zip(INV_FIELDS, inf_fields):
+            session.findById(B + fid).text = val
+        if inf_fields:
+            print(f"    [INF] ΤΙΜΟΛΟΓΙΟ 1–{len(inf_fields)}: {' | '.join(inf_fields)}")
+        if inf_left:
+            print(f"    [INF] ⚠ ΔΕΝ ΧΩΡΑΝΕ στα 4 πεδία: {'/'.join(inf_left)} — συμπλήρωσέ τα με το χέρι")
+
     is_special = (kath == 3 and tk_ == "6121" and pr == "SUPPLIER_X LTD" and dk == "76012080")
 
     if is_special:
         session.findById(B + "ctxtZIMP_1-ZDUED").text = il
-        session.findById(B + "txtZIMP_1-ZDOCDYN").text = "YOUR_DOC_REF_1"
+        session.findById(B + "txtZIMP_1-ZDOCDYN").text = "YOUR_PASSIVE_AUTH"
         session.findById(B + "txtZIMP_1-MENGE").text = vr
         session.findById(B + "ctxtZIMP_1-MEINS").text = "KG"
         session.findById(B + "txtZIMP_1-VALUE").text = sa
@@ -1624,12 +1714,12 @@ def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot,
         session.findById(B + "txtZIMP_1-ZKURSF_42").text = is_
         session.findById(B + "txtZIMP_1-VALUE").text = sa
         session.findById(B + "txtZIMP_1-ZWRBTR_EUR_42").text = sa
-        if sd != "24":
+        if not nd:
             session.findById(B + "txtZIMP_1-ZKBERT_DUTIES_42").text = sd
             session.findById(B + "txtZIMP_1-ZWRBTR_DUTIES_42").text = da
         session.findById(B + "txtZIMP_1-ZKBERT_TAXES_42").text = sf
         session.findById(B + "txtZIMP_1-ZWRBTR_TAXES_42").text = fp
-        if sd != "24" and ea.upper() != "NO":
+        if (not nd or tk_ == "6121") and ea.upper() != "NO" and ea not in ("", "nan", "None"):
             session.findById(B + "ctxtZIMP_1-EBELN").text = ea
 
         session.findById(B + "chkZIMP_1-ZCHECK").Selected = True
@@ -1643,7 +1733,7 @@ def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot,
         pass
     else:  # kath == 2
         session.findById(B + "ctxtZIMP_1-ZDUED").text = il2
-        session.findById(B + "txtZIMP_1-ZDOCDYN").text = "23GR000001IP00242"
+        session.findById(B + "txtZIMP_1-ZDOCDYN").text = "YOUR_ACTIVE_AUTH"
 
     session.findById(B + "txtZIMP_1-MENGE").text = vr
     session.findById(B + "ctxtZIMP_1-MEINS").text = "KG"
@@ -1651,7 +1741,7 @@ def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot,
     session.findById(B + "txtZIMP_1-ZWRBTR_EUR_42").text = sa
     session.findById(B + "ctxtZIMP_1-WAERS").text = ns
 
-    if sd == "24":
+    if nd:
         pr = f"ΦΥΡΑ - ΕΚΚΑΘΑΡΙΣΗ {im}"
 
     is_c = ty.upper().endswith("C")
@@ -1660,24 +1750,24 @@ def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot,
     # παλιό κώδικα, ΣΥΜΠΕΡΙΛΑΜΒΑΝΟΜΕΝΟΥ του edge case: αν is_c ΚΑΙ ΚΑΘ==12,
     # ο παλιός κώδικας δεν έγραφε ΤΙΠΟΤΑ εδώ (ούτε καν ΠΡΟΜ/ZLFINN) — το ίδιο κρατάμε.
     if kath == 2:
-        session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "YOUR_DOC_REF_2"
-        session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = "YOUR_DOC_REF_3"
-        session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "18GR000001SASP00058"
+        session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "YOUR_LICENSE_C"
+        session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = pick_grn(GRN_ENERG, im)
+        session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "YOUR_LICENSE_S_1"
         session.findById(B + "txtZIMP_1-ZLFINN").text = pr
         session.findById(B + "ctxtZIMP_1-ZDATANT").text = ip
         session.findById(B + "txtZIMP_1-ZPSAPOF").text = "10790/13-06-2003"
     elif kath == 3:
         if is_c:
-            session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "18GR000001CGU1CT000004"
-            session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = "YOUR_DOC_REF_4"
-            session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "18GR000001SASP00057"
+            session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "YOUR_LICENSE_C"
+            session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = pick_grn(GRN_IMC, im)
+            session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "YOUR_LICENSE_S_2"
         session.findById(B + "txtZIMP_1-ZLFINN").text = pr
         session.findById(B + "txtZIMP_1-ZPSAPOF").text = "YOUR_PERMIT_REF"
     elif kath == 5:
         if is_c:
-            session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "18GR000001CGU1CT000004"
-            session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = "YOUR_DOC_REF_4"
-            session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "18GR000001SASP00057"
+            session.findById(B + "txtZIMP_1-ZLICENSE_C").text = "YOUR_LICENSE_C"
+            session.findById(B + "txtZIMP_1-ZGRN_WARRANTY").text = pick_grn(GRN_IMC, im)
+            session.findById(B + "txtZIMP_1-ZLICENSE_S").text = "YOUR_LICENSE_S_2"
         session.findById(B + "txtZIMP_1-ZLFINN").text = pr
         session.findById(B + "txtZIMP_1-ZPSAPOF").text = "."
     elif kath == 12:
@@ -1706,9 +1796,11 @@ def _sap_entry_fields(session, B, row, kath, kr1, vr1, kr2, vr2, kr3, vr3, prot,
     session.findById(B + "txtZIMP_1-ZWRBTR_EUR_42").text = sa
 
     # ── Δασμός / ΦΠΑ ─────────────────────────────────────────────────────
-    if sd == "24":
+    if nd:
         session.findById(B + "txtZIMP_1-ZKBERT_TAXES_42").text = sf
         session.findById(B + "txtZIMP_1-ZWRBTR_TAXES_42").text = fp
+        if tk_ == "6121" and ea.upper() != "NO" and ea not in ("", "nan", "None"):
+            session.findById(B + "ctxtZIMP_1-EBELN").text = ea      # επανεισαγωγή: εντολή και χωρίς δασμό
     else:
         session.findById(B + "txtZIMP_1-ZKBERT_DUTIES_42").text = sd
         session.findById(B + "txtZIMP_1-ZWRBTR_DUTIES_42").text = da
@@ -1930,7 +2022,7 @@ def enter_mrn(job: dict, session) -> bool:
         # ΜΕΤΑ που θα είναι έτοιμο το δικό της XML — όχι τώρα.
 
     # Β.5 PDF Move — ΜΙΑ φορά για ΟΛΗ τη δήλωση, ΜΕΤΑ από ΟΛΑ τα Α/Α (ίδιο
-    # pattern με το ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ NEW — ποτέ Move ενδιάμεσα, γιατί όλα τα
+    # pattern με το script ΕΙΣΑΓΩΓΕΣ ΠΕΙΡΑΙΑ — ποτέ Move ενδιάμεσα, γιατί όλα τα
     # Α/Α μοιράζονται το ίδιο PDF).
     if dst_pdf and dst_pdf.exists():
         first_row = df_result.iloc[0]
@@ -2150,6 +2242,9 @@ def main():
             if enter_mrn(job, session):
                 ok_n += 1
                 mark_done(job["mrn"])
+                # Πέρασε στο SAP -> το XML δεν χρειάζεται πια (κρατιούνται μόνο όσα δεν έχουν περαστεί,
+                # για το ΕΛΕΓΧΟΣ ΔΙΑΣΑΦΗΣΕΩΝ — ζητήθηκε 2026-10-08)
+                (XML_DIR / f"{job['mrn']}.xml").unlink(missing_ok=True)
             else:
                 fail_n += 1
                 # enter_mrn() έχει ήδη κάνει close_sap() — με νεκρό session το
